@@ -1,0 +1,24 @@
+# ── Core GUI & DB ────────────────────────────────────────────────────────────
+# tkinter ships with Python (no pip install needed)
+# sqlite3 ships with Python (no pip install needed)
+
+# ── Security ─────────────────────────────────────────────────────────────────
+bcrypt>=4.0.1           # Preferred password hashing (Argon2-style cost factor)
+
+# ── Fuzzy Matching ───────────────────────────────────────────────────────────
+rapidfuzz>=3.6.1        # Fast Levenshtein/fuzzy matching; MIT license
+                        # Fallback: fuzzywuzzy (slower, GPL-dependent)
+
+# ── Excel Import / Export ────────────────────────────────────────────────────
+openpyxl>=3.1.2         # Read/write .xlsx without LibreOffice dependency
+
+# ── REST Server (optional – server mode only) ────────────────────────────────
+Flask>=3.0.0            # Lightweight WSGI server exposing JSON API
+Flask-HTTPAuth>=4.8.0   # Token/Basic auth helper for Flask routes
+
+# ── HTTP Client (client side in server mode) ─────────────────────────────────
+requests>=2.31.0        # Makes REST calls from Tkinter client to Flask server
+
+# ── Optional / Dev ───────────────────────────────────────────────────────────
+pandas>=2.1.0           # Optional: faster CSV/Excel parsing in ImportService
+PyInstaller>=6.3.0      # Packaging to .exe (Windows) / binary (Linux/macOS)
