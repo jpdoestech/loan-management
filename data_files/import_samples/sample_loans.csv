@@ -1,0 +1,6 @@
+employee_name,employee_code,requested_amount,interest_rate,term_months,purpose
+Juan dela Cruz,EMP001,5000,2,3,Medical expenses
+Maria Santos,EMP002,10000,3,6,Education
+Pedro Reyes,EMP003,3000,2,2,Home repair
+Ana Garcia,EMP004,8000,2.5,4,Emergency
+Jose Rizal Jr.,EMP005,6000,2,3,Travel

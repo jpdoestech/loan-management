@@ -1,0 +1,4 @@
+loan_reference,employee_name,amount,payment_date,payment_method,reference,notes
+CA-20250101-AA1,Juan dela Cruz,1500,2025-02-01,cash,REC001,First payment
+CA-20250101-AA1,Juan dela Cruz,1500,2025-03-01,bank_transfer,REC002,Second payment
+CA-20250101-BB2,Maria Santos,2000,2025-03-15,salary_deduction,,Monthly deduction

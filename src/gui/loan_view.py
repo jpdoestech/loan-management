@@ -1,303 +1,284 @@
-"""Loan management view with approve/reject and repayment actions."""
+"""Loan management view — list, create, approve, disburse, record payments."""
 from __future__ import annotations
-
-import threading
 import tkinter as tk
-from datetime import date
-from tkinter import messagebox, ttk
-from typing import Any, Dict, List, Optional
-
-from src.data import db_manager as db
-from src.gui.dialogs import FormDialog, show_error, show_info, ask_yes_no
-from src.services import auth_service, loan_service
-from src.utils.helpers import format_currency
-from src.utils.logger import get_logger
-
-log = get_logger(__name__)
-
-_COLS = [
-    ("id", "ID", 40), ("reference_number", "Reference", 130),
-    ("employee_name", "Employee", 160), ("requested_amount", "Requested", 95),
-    ("approved_amount", "Approved", 90), ("interest_rate", "Rate%", 60),
-    ("term_months", "Term", 50), ("status", "Status", 80),
-    ("application_date", "App Date", 95),
-]
-
-_STATUS_COLORS = {
-    "pending": "#f0ad4e",
-    "active": "#5cb85c",
-    "completed": "#337ab7",
-    "rejected": "#d9534f",
-    "cancelled": "#777",
-}
+from tkinter import ttk, messagebox
+from typing import Optional
+from ..data.db_manager import DBManager
+from ..services.auth_service import AuthService
+from ..services.loan_service import LoanService
+from .dialogs import FormDialog, show_error, show_info, ask_confirm, SearchableListDialog
 
 
 class LoanView(ttk.Frame):
-    """Loan list, detail, and action view.
+    """Full loan lifecycle view."""
 
-    Args:
-        master: Parent widget.
-    """
-
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master)
-        self._rows: List[Dict] = []
-        self._build_ui()
+    def __init__(self, parent: tk.Widget, db: DBManager, auth: AuthService) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.auth = auth
+        self.loan_svc = LoanService(db)
+        self._build()
         self.refresh()
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        # Toolbar
+        tb = ttk.Frame(self)
+        tb.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(tb, text="Cash Advances / Loans", font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Button(tb, text="＋ New", command=self._new_loan).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="✔ Approve", command=self._approve).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="💸 Disburse", command=self._disburse).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="✗ Reject", command=self._reject).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="💳 Payment", command=self._payment).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="↺", command=self.refresh).pack(side=tk.RIGHT, padx=2)
 
-    def _build_ui(self) -> None:
-        # Top toolbar
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(toolbar, text="Status:").pack(side=tk.LEFT)
-        self._status_var = tk.StringVar(value="all")
-        status_cb = ttk.Combobox(
-            toolbar, textvariable=self._status_var, width=12, state="readonly",
-            values=["all", "pending", "active", "completed", "rejected", "cancelled"],
-        )
-        status_cb.pack(side=tk.LEFT, padx=4)
-        status_cb.bind("<<ComboboxSelected>>", lambda _: self.refresh())
-
-        ttk.Label(toolbar, text="Search:").pack(side=tk.LEFT, padx=(8, 0))
+        # Filters
+        ff = ttk.Frame(self)
+        ff.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(ff, text="Status:").pack(side=tk.LEFT)
+        self._status_var = tk.StringVar(value="All")
+        cb = ttk.Combobox(ff, textvariable=self._status_var, width=12, state="readonly",
+                          values=["All", "pending", "approved", "active", "closed", "rejected"])
+        cb.pack(side=tk.LEFT, padx=(4, 12))
+        cb.bind("<<ComboboxSelected>>", lambda _: self.refresh())
+        ttk.Label(ff, text="Search:").pack(side=tk.LEFT)
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._filter())
-        ttk.Entry(toolbar, textvariable=self._search_var, width=22).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(ff, textvariable=self._search_var, width=28).pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(toolbar, text="➕ New Loan", command=self._new_loan).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="✅ Approve", command=self._approve).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="❌ Reject", command=self._reject).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="💵 Repayment", command=self._add_repayment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="🔄 Refresh", command=self.refresh).pack(side=tk.LEFT, padx=2)
+        # Main pane — top: loans list; bottom: repayments for selected
+        pane = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        # Main paned area: tree on left, detail on right
-        pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        pane.pack(fill=tk.BOTH, expand=True)
-
-        # Tree
-        tree_frame = ttk.Frame(pane)
-        pane.add(tree_frame, weight=3)
-
-        cols = [c[0] for c in _COLS]
-        self._tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
-        for cid, label, width in _COLS:
-            self._tree.heading(cid, text=label)
-            self._tree.column(cid, width=width, anchor=tk.W)
-        sy = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._tree.yview)
-        self._tree.configure(yscrollcommand=sy.set)
+        # Loans treeview
+        loan_frame = ttk.LabelFrame(pane, text="Loans")
+        pane.add(loan_frame, weight=3)
+        cols = ("ID", "Reference", "Employee", "Amount", "Approved", "Rate%",
+                "Term", "Status", "Applied", "Due", "Balance")
+        self._tree = ttk.Treeview(loan_frame, columns=cols, show="headings", selectmode="browse")
+        widths = (40, 130, 160, 90, 90, 50, 50, 80, 90, 90, 90)
+        for col, w in zip(cols, widths):
+            self._tree.heading(col, text=col, command=lambda c=col: self._sort(c))
+            self._tree.column(col, width=w,
+                              anchor=tk.CENTER if col in ("ID","Rate%","Term","Status") else tk.W)
+        vsb = ttk.Scrollbar(loan_frame, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sy.pack(side=tk.RIGHT, fill=tk.Y)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        # Detail panel
-        detail_frame = ttk.LabelFrame(pane, text="Loan Detail", padding=10)
-        pane.add(detail_frame, weight=1)
-        self._detail_text = tk.Text(detail_frame, state=tk.DISABLED, wrap=tk.WORD,
-                                    width=32, font=("Consolas", 9))
-        self._detail_text.pack(fill=tk.BOTH, expand=True)
+        # Tag colours
+        self._tree.tag_configure("pending", foreground="#F39C12")
+        self._tree.tag_configure("approved", foreground="#27AE60")
+        self._tree.tag_configure("active", foreground="#2980B9")
+        self._tree.tag_configure("closed", foreground="#7F8C8D")
+        self._tree.tag_configure("rejected", foreground="#E74C3C")
 
-        # Status-colour tags
-        for status, color in _STATUS_COLORS.items():
-            self._tree.tag_configure(status, background=color + "33")  # 20% alpha hex
+        # Repayments treeview
+        rep_frame = ttk.LabelFrame(pane, text="Repayments for Selected Loan")
+        pane.add(rep_frame, weight=1)
+        rcols = ("Date", "Amount", "Method", "Reference", "Notes")
+        self._rep_tree = ttk.Treeview(rep_frame, columns=rcols, show="headings")
+        for c in rcols:
+            self._rep_tree.heading(c, text=c)
+            self._rep_tree.column(c, width=120)
+        self._rep_tree.pack(fill=tk.BOTH, expand=True)
 
+        self._all_rows: list = []
+        self._sort_col: str = "ID"
+        self._sort_rev: bool = True
+
+    # ------------------------------------------------------------------ #
     def refresh(self) -> None:
-        """Reload loans from DB in a background thread."""
         status = self._status_var.get()
-
-        def _load() -> None:
-            rows = db.get_all_loans(status=None if status == "all" else status)
-            self.after(0, lambda: self._populate(rows))
-
-        threading.Thread(target=_load, daemon=True).start()
-
-    def _populate(self, rows: List[Dict]) -> None:
-        self._rows = rows
+        self._all_rows = self.db.list_loans(
+            status=status if status != "All" else None
+        )
         self._filter()
 
     def _filter(self) -> None:
         q = self._search_var.get().lower()
         self._tree.delete(*self._tree.get_children())
-        for row in self._rows:
-            text = f"{row.get('reference_number','')} {row.get('employee_name','')}".lower()
+        for r in self._all_rows:
+            text = f"{r.get('reference_number','')} {r.get('employee_name','')}".lower()
             if q and q not in text:
                 continue
-            status = row.get("status", "")
-            values = []
-            for cid, *_ in _COLS:
-                val = row.get(cid, "") or ""
-                if cid in ("requested_amount", "approved_amount") and val:
-                    val = format_currency(float(val))
-                values.append(val)
-            self._tree.insert("", tk.END, iid=str(row["id"]), values=values, tags=(status,))
+            bal = r.get("outstanding_balance")
+            self._tree.insert("", tk.END, iid=str(r["id"]),
+                              tags=(r.get("status", "pending"),),
+                              values=(
+                                  r["id"], r.get("reference_number",""),
+                                  r.get("employee_name",""),
+                                  f"{r.get('requested_amount',0):,.2f}",
+                                  f"{r.get('approved_amount',0) or 0:,.2f}",
+                                  r.get("interest_rate", 0),
+                                  r.get("term_months", 1),
+                                  r.get("status",""), r.get("application_date",""),
+                                  r.get("due_date",""),
+                                  f"{bal:,.2f}" if bal is not None else "",
+                              ))
 
-    def _selected_id(self) -> Optional[int]:
+    def _sort(self, col: str) -> None:
+        self._sort_rev = not self._sort_rev if self._sort_col == col else False
+        self._sort_col = col
+
+    def _on_select(self, _event=None) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        loan_id = int(sel[0])
+        self._rep_tree.delete(*self._rep_tree.get_children())
+        for r in self.db.list_repayments(loan_id):
+            self._rep_tree.insert("", tk.END, values=(
+                r.get("payment_date",""), f"{r.get('amount',0):,.2f}",
+                r.get("payment_method",""), r.get("reference",""), r.get("notes",""),
+            ))
+
+    def _selected_loan_id(self) -> Optional[int]:
         sel = self._tree.selection()
         return int(sel[0]) if sel else None
 
-    def _on_select(self, _event: Any) -> None:
-        loan_id = self._selected_id()
-        if not loan_id:
-            return
-        threading.Thread(target=self._load_detail, args=(loan_id,), daemon=True).start()
-
-    def _load_detail(self, loan_id: int) -> None:
-        summary = loan_service.get_loan_summary(loan_id)
-        self.after(0, lambda: self._show_detail(summary))
-
-    def _show_detail(self, summary: Dict) -> None:
-        loan = summary.get("loan", {})
-        lines = [
-            f"Ref:      {loan.get('reference_number','')}",
-            f"Employee: {loan.get('employee_name','')}",
-            f"Requested:{format_currency(loan.get('requested_amount') or 0)}",
-            f"Approved: {format_currency(loan.get('approved_amount') or 0)}",
-            f"Rate:     {loan.get('interest_rate',0)}% / month",
-            f"Term:     {loan.get('term_months','')} months",
-            f"Payable:  {format_currency(summary.get('total_payable',0))}",
-            f"Paid:     {format_currency(summary.get('total_paid',0))}",
-            f"Balance:  {format_currency(summary.get('balance',0))}",
-            f"Status:   {loan.get('status','')}",
-            "",
-            "── Repayments ──────────────────",
-        ]
-        for r in summary.get("repayments", []):
-            lines.append(f"  {r.get('payment_date','')}  {format_currency(r.get('amount',0))}"
-                         f"  [{r.get('payment_method','')}]")
-        self._detail_text.configure(state=tk.NORMAL)
-        self._detail_text.delete("1.0", tk.END)
-        self._detail_text.insert(tk.END, "\n".join(lines))
-        self._detail_text.configure(state=tk.DISABLED)
-
-    # ── Actions ───────────────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------ #
     def _new_loan(self) -> None:
-        dlg = _LoanDialog(self, title="New Cash Advance Application")
-        data = dlg.get_data()
-        if data:
+        employees = self.db.list_employees()
+        emp_map = {f"{e['name']} ({e.get('employee_code','')})": e["id"] for e in employees}
+        branches = self.db.list_branches()
+        branch_map = {b["name"]: b["id"] for b in branches}
+
+        fields = [
+            {"key": "employee", "label": "Employee", "type": "combobox",
+             "values": list(emp_map.keys())},
+            {"key": "requested_amount", "label": "Amount Requested"},
+            {"key": "interest_rate", "label": "Interest Rate (%)", "default": "0"},
+            {"key": "term_months", "label": "Term (months)", "default": "1"},
+            {"key": "purpose", "label": "Purpose"},
+            {"key": "branch", "label": "Branch", "type": "combobox",
+             "values": [""] + list(branch_map.keys())},
+        ]
+
+        def save(data: dict) -> None:
+            emp_id = emp_map.get(data.get("employee",""))
+            if not emp_id:
+                show_error("Validation", "Please select an employee.")
+                return
             try:
-                loan_service.apply_loan(
-                    employee_id=int(data["employee_id"]),
-                    requested_amount=float(data.get("requested_amount") or 0),
-                    term_months=int(data.get("term_months") or 1),
-                    interest_rate=float(data.get("interest_rate") or 0),
-                    purpose=data.get("purpose"),
-                    notes=data.get("notes"),
-                )
+                amount = float(data.get("requested_amount", 0))
+                rate = float(data.get("interest_rate", 0))
+                term = int(data.get("term_months", 1))
+            except ValueError:
+                show_error("Validation", "Amount, rate, and term must be numbers.")
+                return
+            bid = branch_map.get(data.get("branch",""))
+            uid = self.auth.current_user.id if self.auth.current_user else None
+            ok, msg, _ = self.loan_svc.create_loan(
+                emp_id, amount, rate, term, data.get("purpose"), bid, uid)
+            if ok:
                 self.refresh()
-                show_info("Created", "Loan application submitted.")
-            except Exception as exc:
-                show_error("Error", str(exc))
+                dlg.destroy()
+                show_info("Success", msg)
+            else:
+                show_error("Error", msg)
+
+        dlg = FormDialog(self, "New Cash Advance", fields, save)
 
     def _approve(self) -> None:
-        loan_id = self._selected_id()
-        if not loan_id:
-            show_info("Select", "Select a loan to approve.")
+        lid = self._selected_loan_id()
+        if not lid:
+            show_error("Select", "Select a loan first.")
             return
-        loan = db.get_loan_by_id(loan_id)
-        if loan and loan["status"] != "pending":
-            show_error("Status", f"Cannot approve a loan with status '{loan['status']}'.")
+        loan = self.loan_svc.get_loan(lid)
+        if not loan or loan.status != "pending":
+            show_error("Invalid", "Only pending loans can be approved.")
             return
-        dlg = _ApproveDialog(self)
-        data = dlg.get_data()
-        if data:
+
+        fields = [{"key": "approved_amount", "label": "Approved Amount",
+                   "default": str(loan.requested_amount)}]
+
+        def save(data: dict) -> None:
             try:
-                loan_service.approve_loan(
-                    loan_id,
-                    approved_amount=float(data.get("approved_amount") or 0),
-                    approval_date=data.get("approval_date"),
-                    first_payment_date=data.get("first_payment_date"),
-                )
+                amt = float(data["approved_amount"])
+            except ValueError:
+                show_error("Validation", "Enter a valid amount.")
+                return
+            uid = self.auth.current_user.id if self.auth.current_user else None
+            ok, msg = self.loan_svc.approve_loan(lid, amt, uid)
+            if ok:
                 self.refresh()
-                show_info("Approved", "Loan approved and set to active.")
-            except Exception as exc:
-                show_error("Error", str(exc))
+                dlg.destroy()
+                show_info("Approved", msg)
+            else:
+                show_error("Error", msg)
+
+        dlg = FormDialog(self, "Approve Loan", fields, save)
+
+    def _disburse(self) -> None:
+        lid = self._selected_loan_id()
+        if not lid:
+            show_error("Select", "Select a loan first.")
+            return
+        if not ask_confirm("Disburse", "Mark this loan as disbursed / active?"):
+            return
+        uid = self.auth.current_user.id if self.auth.current_user else None
+        ok, msg = self.loan_svc.disburse_loan(lid, uid)
+        if ok:
+            self.refresh()
+            show_info("Disbursed", msg)
+        else:
+            show_error("Error", msg)
 
     def _reject(self) -> None:
-        loan_id = self._selected_id()
-        if not loan_id:
-            show_info("Select", "Select a loan to reject.")
+        lid = self._selected_loan_id()
+        if not lid:
+            show_error("Select", "Select a loan first.")
             return
-        if ask_yes_no("Confirm", "Reject this loan application?"):
-            try:
-                loan_service.reject_loan(loan_id)
-                self.refresh()
-            except Exception as exc:
-                show_error("Error", str(exc))
-
-    def _add_repayment(self) -> None:
-        loan_id = self._selected_id()
-        if not loan_id:
-            show_info("Select", "Select a loan to record repayment.")
+        if not ask_confirm("Reject", "Reject this loan application?"):
             return
-        dlg = _RepaymentDialog(self, loan_id=loan_id)
-        data = dlg.get_data()
-        if data:
-            try:
-                loan_service.record_repayment(
-                    loan_id=loan_id,
-                    amount=float(data.get("amount") or 0),
-                    payment_date=data.get("payment_date") or date.today().isoformat(),
-                    payment_method=data.get("payment_method", "cash"),
-                    reference=data.get("reference"),
-                    notes=data.get("notes"),
-                )
-                self.refresh()
-                show_info("Recorded", "Repayment recorded successfully.")
-            except Exception as exc:
-                show_error("Error", str(exc))
+        uid = self.auth.current_user.id if self.auth.current_user else None
+        ok, msg = self.loan_svc.reject_loan(lid, uid)
+        if ok:
+            self.refresh()
+            show_info("Rejected", msg)
+        else:
+            show_error("Error", msg)
 
+    def _payment(self) -> None:
+        lid = self._selected_loan_id()
+        if not lid:
+            show_error("Select", "Select a loan first.")
+            return
+        loan = self.loan_svc.get_loan(lid)
+        if not loan or loan.status not in ("active", "approved"):
+            show_error("Invalid", "Loan must be active or approved to record a payment.")
+            return
 
-# ── Inner dialogs ─────────────────────────────────────────────────────────────
-
-class _LoanDialog(FormDialog):
-    def _build_form(self, frame: ttk.Frame) -> None:
-        employees = db.get_all_employees()
-        emp_opts = [f"{e['id']}:{e['name']} [{e.get('employee_code','') or ''}]" for e in employees]
+        from datetime import date
         fields = [
-            ("Employee *", "employee_id_str", ttk.Combobox, emp_opts, ""),
-            ("Requested Amount *", "requested_amount", ttk.Entry, None, ""),
-            ("Interest Rate (%)", "interest_rate", ttk.Entry, None, "0"),
-            ("Term (months)", "term_months", ttk.Entry, None, "1"),
-            ("Purpose", "purpose", ttk.Entry, None, ""),
-            ("Application Date", "application_date", ttk.Entry, None, date.today().isoformat()),
-            ("Notes", "notes", ttk.Entry, None, ""),
+            {"key": "amount", "label": "Amount"},
+            {"key": "payment_date", "label": "Payment Date",
+             "default": date.today().isoformat()},
+            {"key": "payment_method", "label": "Method", "type": "combobox",
+             "values": ["cash", "bank_transfer", "check", "salary_deduction", "other"],
+             "default": "cash"},
+            {"key": "reference", "label": "Reference / Receipt"},
+            {"key": "notes", "label": "Notes"},
         ]
-        for i, (label, key, wtype, opts, default) in enumerate(fields):
-            self._add_field(frame, label, key, row=i, widget_type=wtype,
-                            options=opts, default=default)
 
-    def _on_save(self) -> None:
-        data = {k: v.get() for k, v in self._vars.items()}
-        emp_str = data.pop("employee_id_str", "")
-        if not emp_str:
-            show_error("Validation", "Please select an employee.")
-            return
-        data["employee_id"] = emp_str.split(":")[0]
-        self._result = data
-        self.destroy()
+        def save(data: dict) -> None:
+            try:
+                amt = float(data["amount"])
+            except ValueError:
+                show_error("Validation", "Enter a valid amount.")
+                return
+            uid = self.auth.current_user.id if self.auth.current_user else None
+            ok, msg = self.loan_svc.record_repayment(
+                lid, amt, data["payment_date"], data["payment_method"],
+                data.get("reference") or None, data.get("notes") or None, uid,
+            )
+            if ok:
+                self.refresh()
+                dlg.destroy()
+                show_info("Recorded", msg)
+            else:
+                show_error("Error", msg)
 
-
-class _ApproveDialog(FormDialog):
-    def _build_form(self, frame: ttk.Frame) -> None:
-        self._add_field(frame, "Approved Amount *", "approved_amount", row=0)
-        self._add_field(frame, "Approval Date", "approval_date", row=1,
-                        default=date.today().isoformat())
-        self._add_field(frame, "First Payment Date", "first_payment_date", row=2)
-
-
-class _RepaymentDialog(FormDialog):
-    def __init__(self, master: tk.Misc, loan_id: int) -> None:
-        self._loan_id = loan_id
-        super().__init__(master, title="Record Repayment")
-
-    def _build_form(self, frame: ttk.Frame) -> None:
-        self._add_field(frame, "Amount *", "amount", row=0)
-        self._add_field(frame, "Payment Date", "payment_date", row=1,
-                        default=date.today().isoformat())
-        self._add_field(frame, "Method", "payment_method", row=2,
-                        widget_type=ttk.Combobox,
-                        options=["cash", "bank", "deduction"])
-        self._add_field(frame, "Reference", "reference", row=3)
-        self._add_field(frame, "Notes", "notes", row=4)
+        dlg = FormDialog(self, f"Record Payment — {loan.reference_number}", fields, save)

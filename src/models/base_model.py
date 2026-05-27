@@ -1,40 +1,25 @@
-"""Base data model with common dict serialisation."""
+"""Base dataclass for all domain models."""
 from __future__ import annotations
-
-from dataclasses import dataclass, asdict, field
-from datetime import datetime
-from typing import Any, Dict
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, Optional
 
 
 @dataclass
 class BaseModel:
-    """Abstract base for all domain models.
+    """Shared fields and helpers for every domain model."""
 
-    Provides ``to_dict`` and ``from_dict`` convenience methods used by
-    DAOs and GUI views.
-    """
+    id: Optional[int] = field(default=None)
+    created_at: Optional[str] = field(default=None)
+    updated_at: Optional[str] = field(default=None)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialise model fields to a plain dictionary.
-
-        Returns:
-            Dict mapping field names to values.
-        """
+        """Return a plain dict representation of this model."""
         return {k: v for k, v in asdict(self).items()}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BaseModel":
-        """Construct a model instance from a dictionary.
+    def from_row(cls, row: Dict[str, Any]) -> "BaseModel":
+        """Construct an instance from a DB row dict.
 
-        Args:
-            data: Dict whose keys correspond to dataclass fields.
-
-        Returns:
-            New model instance with fields populated from *data*.
+        Subclasses should override this with typed construction.
         """
-        field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        filtered = {k: v for k, v in data.items() if k in field_names}
-        return cls(**filtered)
-
-    def __str__(self) -> str:  # noqa: D105
-        return f"{self.__class__.__name__}({self.to_dict()})"
+        return cls(**{k: v for k, v in row.items() if k in cls.__dataclass_fields__})

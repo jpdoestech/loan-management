@@ -1,150 +1,155 @@
-"""Report generation service: CSV and Excel export."""
+"""Report generation — CSV and Excel export."""
 from __future__ import annotations
-
 import csv
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import os
+from datetime import date
+from typing import Dict, List, Optional
 
-from src.data import db_manager as db
-from src.utils.helpers import DATA_DIR, timestamp_filename
-from src.utils.logger import get_logger
+from ..data.db_manager import DBManager
+from ..utils.helpers import ensure_dir, get_app_data_dir
+from ..utils.logger import get_logger
 
-log = get_logger(__name__)
+log = get_logger()
 
-REPORTS_DIR = DATA_DIR / "reports"
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _write_csv(filename: str, headers: List[str], rows: List[Dict]) -> str:
-    path = REPORTS_DIR / filename
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=headers, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    return str(path)
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    _OPENPYXL = True
+except ImportError:
+    _OPENPYXL = False
 
 
-def _write_xlsx(filename: str, headers: List[str], rows: List[Dict], title: str = "") -> str:
-    """Write an XLSX report with basic formatting."""
-    try:
-        import openpyxl  # type: ignore
-        from openpyxl.styles import Font, PatternFill, Alignment
-    except ImportError as exc:
-        raise ImportError("openpyxl is required for Excel export.") from exc
+class ReportService:
+    """Generates CSV and Excel reports."""
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = title or "Report"
+    def __init__(self, db: DBManager) -> None:
+        self.db = db
 
-    # Header row
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True)
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+    # ------------------------------------------------------------------ #
+    # Data queries
+    # ------------------------------------------------------------------ #
 
-    # Data rows
-    for row_idx, row in enumerate(rows, 2):
-        for col_idx, header in enumerate(headers, 1):
-            ws.cell(row=row_idx, column=col_idx, value=row.get(header, ""))
-
-    # Auto-fit columns
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
-
-    path = REPORTS_DIR / filename
-    wb.save(path)
-    return str(path)
-
-
-def export_loans(
-    status: Optional[str] = None,
-    format_: str = "csv",
-    branch_id: Optional[int] = None,
-) -> str:
-    """Export the loan list to CSV or XLSX.
-
-    Args:
-        status:    Optional status filter.
-        format_:   ``"csv"`` or ``"xlsx"``.
-        branch_id: Optional branch filter.
-
-    Returns:
-        Absolute path to the written file.
-    """
-    loans = db.get_all_loans(status=status)
-    if branch_id:
-        loans = [l for l in loans if l.get("branch_id") == branch_id]
-
-    headers = [
-        "id", "reference_number", "employee_name", "employee_code",
-        "requested_amount", "approved_amount", "interest_rate", "term_months",
-        "status", "application_date", "approval_date", "branch_name",
-    ]
-    fname = timestamp_filename("loan_report", format_)
-    if format_ == "xlsx":
-        return _write_xlsx(fname, headers, loans, title="Loan Report")
-    return _write_csv(fname, headers, loans)
-
-
-def export_repayments(loan_id: Optional[int] = None, format_: str = "csv") -> str:
-    """Export repayments to CSV or XLSX.
-
-    Args:
-        loan_id: Optional loan filter.
-        format_: ``"csv"`` or ``"xlsx"``.
-
-    Returns:
-        Absolute path to the written file.
-    """
-    if loan_id:
-        repayments = db.get_repayments_for_loan(loan_id)
-    else:
-        repayments = db.fetchall(
-            "SELECT r.*, l.reference_number AS loan_ref, e.name AS employee_name "
-            "FROM repayments r "
-            "JOIN loans l ON r.loan_id = l.id "
-            "JOIN employees e ON l.employee_id = e.id "
-            "ORDER BY r.payment_date DESC"
+    def loans_summary(self, status: Optional[str] = None,
+                      from_date: Optional[str] = None,
+                      to_date: Optional[str] = None) -> List[Dict]:
+        conditions = []
+        params: list = []
+        if status:
+            conditions.append("l.status=?")
+            params.append(status)
+        if from_date:
+            conditions.append("l.application_date>=?")
+            params.append(from_date)
+        if to_date:
+            conditions.append("l.application_date<=?")
+            params.append(to_date)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return self.db.fetch_all(
+            f"SELECT l.reference_number, e.name AS employee, e.employee_code, "
+            f"l.requested_amount, l.approved_amount, l.interest_rate, l.term_months, "
+            f"l.status, l.application_date, l.due_date, l.outstanding_balance, "
+            f"b.name AS branch "
+            f"FROM loans l "
+            f"LEFT JOIN employees e ON l.employee_id=e.id "
+            f"LEFT JOIN branches b ON l.branch_id=b.id "
+            f"{where} ORDER BY l.application_date DESC",
+            tuple(params),
         )
-    headers = [
-        "id", "loan_id", "loan_ref", "employee_name",
-        "payment_date", "amount", "payment_method", "reference", "notes",
-    ]
-    fname = timestamp_filename("repayment_report", format_)
-    if format_ == "xlsx":
-        return _write_xlsx(fname, headers, repayments, title="Repayment Report")
-    return _write_csv(fname, headers, repayments)
 
+    def repayments_summary(self, from_date: Optional[str] = None,
+                           to_date: Optional[str] = None) -> List[Dict]:
+        conditions = []
+        params: list = []
+        if from_date:
+            conditions.append("r.payment_date>=?")
+            params.append(from_date)
+        if to_date:
+            conditions.append("r.payment_date<=?")
+            params.append(to_date)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return self.db.fetch_all(
+            f"SELECT r.payment_date, l.reference_number, e.name AS employee, "
+            f"r.amount, r.payment_method, r.reference, r.notes "
+            f"FROM repayments r "
+            f"LEFT JOIN loans l ON r.loan_id=l.id "
+            f"LEFT JOIN employees e ON l.employee_id=e.id "
+            f"{where} ORDER BY r.payment_date DESC",
+            tuple(params),
+        )
 
-def loan_aging_report(as_of: Optional[date] = None) -> List[Dict]:
-    """Return loans overdue as of *as_of* date.
+    def outstanding_balances(self) -> List[Dict]:
+        return self.db.fetch_all(
+            "SELECT l.reference_number, e.name AS employee, e.employee_code, "
+            "l.approved_amount, l.outstanding_balance, l.due_date, l.status, "
+            "b.name AS branch "
+            "FROM loans l "
+            "LEFT JOIN employees e ON l.employee_id=e.id "
+            "LEFT JOIN branches b ON l.branch_id=b.id "
+            "WHERE l.status IN ('active','approved') "
+            "ORDER BY l.outstanding_balance DESC"
+        )
 
-    Args:
-        as_of: Reference date (defaults to today).
+    # ------------------------------------------------------------------ #
+    # CSV export
+    # ------------------------------------------------------------------ #
 
-    Returns:
-        List of loan summary dicts with outstanding balance.
-    """
-    as_of = as_of or date.today()
-    loans = db.get_all_loans(status="active")
-    result = []
-    for loan in loans:
-        paid = db.get_total_paid(loan["id"])
-        principal = float(loan.get("approved_amount") or loan["requested_amount"])
-        rate = float(loan.get("interest_rate") or 0)
-        term = int(loan.get("term_months") or 1)
-        total_payable = principal * (1 + rate / 100 * term)
-        balance = max(total_payable - paid, 0)
-        if balance > 0:
-            result.append({
-                **loan,
-                "total_payable": total_payable,
-                "total_paid": paid,
-                "balance": balance,
-            })
-    return result
+    def export_csv(self, rows: List[Dict], filename: str) -> str:
+        """Write *rows* to *filename* as CSV. Returns the file path."""
+        ensure_dir(os.path.dirname(filename))
+        if not rows:
+            return filename
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        log.info("Exported CSV: %s (%d rows)", filename, len(rows))
+        return filename
+
+    # ------------------------------------------------------------------ #
+    # Excel export
+    # ------------------------------------------------------------------ #
+
+    def export_excel(self, rows: List[Dict], filename: str,
+                     sheet_name: str = "Report") -> str:
+        """Write *rows* to *filename* as .xlsx. Returns the file path."""
+        if not _OPENPYXL:
+            log.warning("openpyxl not installed; falling back to CSV")
+            return self.export_csv(rows, filename.replace(".xlsx", ".csv"))
+
+        ensure_dir(os.path.dirname(filename))
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+
+        if not rows:
+            wb.save(filename)
+            return filename
+
+        headers = list(rows[0].keys())
+        header_fill = PatternFill("solid", fgColor="2E86C1")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header.replace("_", " ").title())
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for row_idx, row in enumerate(rows, 2):
+            for col_idx, key in enumerate(headers, 1):
+                ws.cell(row=row_idx, column=col_idx, value=row.get(key))
+
+        # Auto-size columns
+        for col in ws.columns:
+            max_len = max((len(str(c.value or "")) for c in col), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+        wb.save(filename)
+        log.info("Exported Excel: %s (%d rows)", filename, len(rows))
+        return filename
+
+    def default_export_path(self, report_type: str, ext: str = "xlsx") -> str:
+        today = date.today().strftime("%Y%m%d")
+        export_dir = os.path.join(get_app_data_dir(), "exports")
+        ensure_dir(export_dir)
+        return os.path.join(export_dir, f"{report_type}_{today}.{ext}")

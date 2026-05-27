@@ -1,75 +1,35 @@
-"""Password hashing utilities.
-
-Attempts to use *bcrypt* for Argon2-class work-factor security.
-Falls back to salted SHA-256 when bcrypt is not installed so the
-application still runs in restricted environments.
-"""
-from __future__ import annotations
-
-import hashlib
+"""Password hashing utilities — bcrypt preferred, PBKDF2-SHA256 fallback."""
 import os
-import secrets
-
-from src.utils.logger import get_logger
-
-log = get_logger(__name__)
+import hashlib
 
 try:
-    import bcrypt as _bcrypt  # type: ignore
-    _USE_BCRYPT = True
-    log.info("Using bcrypt for password hashing.")
+    import bcrypt as _bcrypt
+    _BCRYPT = True
 except ImportError:
-    _USE_BCRYPT = False
-    log.warning("bcrypt not available – falling back to salted SHA-256.")
+    _BCRYPT = False
 
 
-# ─── Public API ──────────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    """Return a secure hash of *password*.
 
-def hash_password(plain: str) -> str:
-    """Hash a plaintext password and return the storable string.
-
-    Args:
-        plain: The user's plaintext password.
-
-    Returns:
-        A hash string suitable for database storage.
+    Uses bcrypt when available; falls back to PBKDF2-HMAC-SHA256 with a
+    random 32-byte salt stored as ``<hex_salt>:<hex_key>``.
     """
-    if _USE_BCRYPT:
-        return _bcrypt.hashpw(plain.encode(), _bcrypt.gensalt(rounds=12)).decode()
-    return _sha256_hash(plain)
+    if _BCRYPT:
+        return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt(rounds=12)).decode()
+    salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+    return f"{salt.hex()}:{key.hex()}"
 
 
-def verify_password(plain: str, stored: str) -> bool:
-    """Verify a plaintext password against a stored hash.
-
-    Args:
-        plain:  Plaintext password to check.
-        stored: Hash previously returned by :func:`hash_password`.
-
-    Returns:
-        ``True`` if the password matches, ``False`` otherwise.
-    """
-    if _USE_BCRYPT and stored.startswith("$2"):
-        try:
-            return _bcrypt.checkpw(plain.encode(), stored.encode())
-        except Exception:  # noqa: BLE001
-            return False
-    return _sha256_verify(plain, stored)
-
-
-# ─── Private helpers ─────────────────────────────────────────────────────────
-
-def _sha256_hash(plain: str) -> str:
-    salt = secrets.token_hex(16)
-    digest = hashlib.sha256(f"{salt}{plain}".encode()).hexdigest()
-    return f"sha256${salt}${digest}"
-
-
-def _sha256_verify(plain: str, stored: str) -> bool:
+def verify_password(password: str, hashed: str) -> bool:
+    """Return True if *password* matches *hashed*."""
+    if hashed.startswith("$2") and _BCRYPT:
+        return _bcrypt.checkpw(password.encode(), hashed.encode())
     try:
-        _, salt, digest = stored.split("$")
-        return secrets.compare_digest(
-            hashlib.sha256(f"{salt}{plain}".encode()).hexdigest(), digest
-        )
+        salt_hex, key_hex = hashed.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+        return key.hex() == key_hex
     except (ValueError, AttributeError):
         return False

@@ -1,61 +1,58 @@
 """User management service."""
 from __future__ import annotations
+from typing import List, Optional, Tuple
+from ..data.db_manager import DBManager
+from ..models.user import User, ROLES
+from ..utils.crypto import hash_password
+from ..utils.logger import get_logger
 
-from typing import Dict, List, Optional
-
-from src.data import db_manager as db
-from src.services import auth_service
-from src.utils.crypto import hash_password
-from src.utils.logger import get_logger
-
-log = get_logger(__name__)
+log = get_logger()
 
 
-def list_users() -> List[Dict]:
-    """Return all users (admin only)."""
-    auth_service.require_role("admin")
-    return db.get_all_users()
+class UserService:
+    """CRUD operations for user accounts."""
 
+    def __init__(self, db: DBManager) -> None:
+        self.db = db
 
-def update_user(user_id: int, data: Dict) -> None:
-    """Update user profile fields (admin only).
+    def list_users(self) -> List[User]:
+        return [User.from_row(r) for r in self.db.list_users()]
 
-    Args:
-        user_id: Target user PK.
-        data:    Dict of fields to update.
-    """
-    auth_service.require_role("admin")
-    db.update_user(user_id, data)
-    actor = auth_service.get_current_user()
-    db.write_audit_log(
-        "UPDATE", user_id=actor.id if actor else None,
-        table_name="users", record_id=user_id,
-    )
+    def get_user(self, user_id: int) -> Optional[User]:
+        row = self.db.get_user_by_id(user_id)
+        return User.from_row(row) if row else None
 
+    def create_user(self, username: str, password: str, full_name: str,
+                    role: str, branch_id: Optional[int],
+                    actor_id: Optional[int]) -> Tuple[bool, str]:
+        """Create a new user. Returns (success, message)."""
+        if not username.strip():
+            return False, "Username is required"
+        if role not in ROLES:
+            return False, f"Role must be one of {ROLES}"
+        if len(password) < 6:
+            return False, "Password must be at least 6 characters"
+        existing = self.db.get_user_by_username(username)
+        if existing:
+            return False, f"Username '{username}' already exists"
+        uid = self.db.create_user(username, hash_password(password), full_name, role, branch_id)
+        self.db.log_action(actor_id, "CREATE_USER", "users", uid, f"Created user {username}")
+        log.info("Created user '%s' (id=%d)", username, uid)
+        return True, "User created successfully"
 
-def deactivate_user(user_id: int) -> None:
-    """Deactivate (soft-delete) a user account.
+    def update_user(self, user_id: int, full_name: str, role: str,
+                    branch_id: Optional[int], is_active: int,
+                    actor_id: Optional[int]) -> Tuple[bool, str]:
+        if role not in ROLES:
+            return False, f"Invalid role '{role}'"
+        self.db.update_user(user_id, full_name, role, branch_id, is_active)
+        self.db.log_action(actor_id, "UPDATE_USER", "users", user_id)
+        return True, "User updated"
 
-    Args:
-        user_id: Target user PK.
-    """
-    auth_service.require_role("admin")
-    db.execute("UPDATE users SET is_active=0 WHERE id=?", (user_id,))
-
-
-def reset_password(user_id: int, new_password: str) -> None:
-    """Reset a user's password (admin only).
-
-    Args:
-        user_id:      Target user PK.
-        new_password: New plaintext password.
-    """
-    auth_service.require_role("admin")
-    pw = hash_password(new_password)
-    db.execute("UPDATE users SET password_hash=? WHERE id=?", (pw, user_id))
-    actor = auth_service.get_current_user()
-    db.write_audit_log(
-        "UPDATE", user_id=actor.id if actor else None,
-        table_name="users", record_id=user_id,
-        detail="password_reset",
-    )
+    def reset_password(self, user_id: int, new_password: str,
+                       actor_id: Optional[int]) -> Tuple[bool, str]:
+        if len(new_password) < 6:
+            return False, "Password must be at least 6 characters"
+        self.db.update_user_password(user_id, hash_password(new_password))
+        self.db.log_action(actor_id, "RESET_PASSWORD", "users", user_id)
+        return True, "Password reset"

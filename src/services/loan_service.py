@@ -1,196 +1,159 @@
-"""Loan and repayment business logic."""
+"""Loan and repayment business-logic service."""
 from __future__ import annotations
-
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from src.data import db_manager as db
-from src.services import auth_service
-from src.utils.helpers import generate_reference_number
-from src.utils.logger import get_logger
+from ..data.db_manager import DBManager
+from ..models.loan import Loan
+from ..models.repayment import Repayment
+from ..utils.helpers import generate_reference
+from ..utils.logger import get_logger
 
-log = get_logger(__name__)
-
-
-def apply_loan(
-    employee_id: int,
-    requested_amount: float,
-    term_months: int,
-    interest_rate: float = 0.0,
-    purpose: Optional[str] = None,
-    branch_id: Optional[int] = None,
-    notes: Optional[str] = None,
-    application_date: Optional[str] = None,
-) -> int:
-    """Submit a cash-advance application.
-
-    Args:
-        employee_id:      Employee PK.
-        requested_amount: Amount requested.
-        term_months:      Repayment period in months.
-        interest_rate:    Monthly interest percentage.
-        purpose:          Reason for the advance.
-        branch_id:        Branch PK.
-        notes:            Free-form notes.
-        application_date: ISO date string; defaults to today.
-
-    Returns:
-        New loan PK.
-    """
-    actor = auth_service.get_current_user()
-    ref = generate_reference_number("CA")
-    app_date = application_date or date.today().isoformat()
-    data = {
-        "reference_number": ref,
-        "employee_id": employee_id,
-        "branch_id": branch_id,
-        "requested_amount": requested_amount,
-        "interest_rate": interest_rate,
-        "term_months": term_months,
-        "purpose": purpose,
-        "status": "pending",
-        "application_date": app_date,
-        "processed_by": actor.id if actor else None,
-        "notes": notes,
-    }
-    loan_id = db.create_loan(data)
-    db.write_audit_log(
-        "CREATE", user_id=actor.id if actor else None,
-        table_name="loans", record_id=loan_id,
-        detail=f"ref={ref}, amount={requested_amount}, employee_id={employee_id}",
-    )
-    log.info("Loan %s created (id=%d, employee_id=%d).", ref, loan_id, employee_id)
-    return loan_id
+log = get_logger()
 
 
-def approve_loan(
-    loan_id: int,
-    approved_amount: float,
-    approval_date: Optional[str] = None,
-    first_payment_date: Optional[str] = None,
-) -> None:
-    """Approve a pending loan application.
+class LoanService:
+    """Orchestrates cash advance lifecycle."""
 
-    Args:
-        loan_id:           Loan PK.
-        approved_amount:   Actual disbursed amount.
-        approval_date:     ISO date; defaults to today.
-        first_payment_date: ISO date of first repayment.
-    """
-    auth_service.require_role("manager")
-    actor = auth_service.get_current_user()
-    app_date = approval_date or date.today().isoformat()
-    db.execute(
-        """UPDATE loans SET status='active', approved_amount=?,
-               approval_date=?, first_payment_date=?, approved_by=?
-           WHERE id=?""",
-        (approved_amount, app_date, first_payment_date, actor.id if actor else None, loan_id),
-    )
-    db.write_audit_log(
-        "UPDATE", user_id=actor.id if actor else None,
-        table_name="loans", record_id=loan_id,
-        detail=f"approved_amount={approved_amount}, status=active",
-    )
+    def __init__(self, db: DBManager) -> None:
+        self.db = db
 
+    # ------------------------------------------------------------------ #
+    # Loans
+    # ------------------------------------------------------------------ #
 
-def reject_loan(loan_id: int, reason: Optional[str] = None) -> None:
-    """Reject a pending loan.
+    def list_loans(self, status: Optional[str] = None,
+                   employee_id: Optional[int] = None) -> List[Loan]:
+        return [Loan.from_row(r) for r in self.db.list_loans(status, employee_id)]
 
-    Args:
-        loan_id: Loan PK.
-        reason:  Optional rejection reason stored in notes.
-    """
-    auth_service.require_role("manager")
-    actor = auth_service.get_current_user()
-    db.execute(
-        "UPDATE loans SET status='rejected', notes=? WHERE id=?",
-        (reason, loan_id),
-    )
-    db.write_audit_log(
-        "UPDATE", user_id=actor.id if actor else None,
-        table_name="loans", record_id=loan_id,
-        detail=f"status=rejected, reason={reason}",
-    )
+    def get_loan(self, loan_id: int) -> Optional[Loan]:
+        row = self.db.get_loan_by_id(loan_id)
+        return Loan.from_row(row) if row else None
 
+    def create_loan(self, employee_id: int, requested_amount: float,
+                    interest_rate: float, term_months: int,
+                    purpose: Optional[str], branch_id: Optional[int],
+                    created_by: Optional[int]) -> Tuple[bool, str, Optional[int]]:
+        """Create a new pending loan application."""
+        if requested_amount <= 0:
+            return False, "Amount must be positive", None
+        if term_months < 1:
+            return False, "Term must be at least 1 month", None
 
-def record_repayment(
-    loan_id: int,
-    amount: float,
-    payment_date: str,
-    payment_method: str = "cash",
-    reference: Optional[str] = None,
-    notes: Optional[str] = None,
-) -> int:
-    """Record a loan repayment and update loan status if fully paid.
+        ref = generate_reference("CA")
+        app_date = date.today().isoformat()
+        due_date = (date.today() + timedelta(days=30 * term_months)).isoformat()
+        total = requested_amount * (1 + (interest_rate / 100) * term_months)
 
-    Args:
-        loan_id:        Loan PK.
-        amount:         Payment amount.
-        payment_date:   ISO date of payment.
-        payment_method: ``"cash"``, ``"bank"``, or ``"deduction"``.
-        reference:      External reference / receipt number.
-        notes:          Optional notes.
+        loan_data = {
+            "reference_number": ref,
+            "employee_id": employee_id,
+            "requested_amount": requested_amount,
+            "approved_amount": None,
+            "interest_rate": interest_rate,
+            "term_months": term_months,
+            "status": "pending",
+            "purpose": purpose,
+            "application_date": app_date,
+            "due_date": due_date,
+            "outstanding_balance": total,
+            "branch_id": branch_id,
+            "created_by": created_by,
+        }
+        loan_id = self.db.create_loan(loan_data)
+        self.db.log_action(created_by, "CREATE_LOAN", "loans", loan_id,
+                           f"Ref:{ref} Emp:{employee_id} Amt:{requested_amount}")
+        log.info("Created loan %s (id=%d)", ref, loan_id)
+        return True, f"Loan {ref} created", loan_id
 
-    Returns:
-        New repayment PK.
-    """
-    actor = auth_service.get_current_user()
-    repay_id = db.create_repayment({
-        "loan_id": loan_id,
-        "payment_date": payment_date,
-        "amount": amount,
-        "payment_method": payment_method,
-        "reference": reference,
-        "notes": notes,
-        "recorded_by": actor.id if actor else None,
-    })
-    _check_loan_completion(loan_id)
-    db.write_audit_log(
-        "CREATE", user_id=actor.id if actor else None,
-        table_name="repayments", record_id=repay_id,
-        detail=f"loan_id={loan_id}, amount={amount}",
-    )
-    return repay_id
+    def approve_loan(self, loan_id: int, approved_amount: float,
+                     actor_id: Optional[int]) -> Tuple[bool, str]:
+        """Approve a pending loan."""
+        loan = self.get_loan(loan_id)
+        if not loan:
+            return False, "Loan not found"
+        if loan.status != "pending":
+            return False, f"Cannot approve a loan with status '{loan.status}'"
+        today = date.today().isoformat()
+        self.db.update_loan_status(loan_id, "approved", approved_amount, today)
+        # recalculate outstanding balance
+        total = approved_amount * (1 + (loan.interest_rate / 100) * loan.term_months)
+        self.db.update_outstanding_balance(loan_id, total)
+        self.db.log_action(actor_id, "APPROVE_LOAN", "loans", loan_id,
+                           f"Approved amount: {approved_amount}")
+        return True, "Loan approved"
 
+    def disburse_loan(self, loan_id: int, actor_id: Optional[int]) -> Tuple[bool, str]:
+        """Mark an approved loan as active/disbursed."""
+        loan = self.get_loan(loan_id)
+        if not loan:
+            return False, "Loan not found"
+        if loan.status != "approved":
+            return False, f"Loan must be approved before disbursement (status: {loan.status})"
+        self.db.execute(
+            "UPDATE loans SET status='active', disbursement_date=date('now'), "
+            "updated_at=datetime('now') WHERE id=?",
+            (loan_id,),
+        )
+        self.db.log_action(actor_id, "DISBURSE_LOAN", "loans", loan_id)
+        return True, "Loan disbursed and marked active"
 
-def _check_loan_completion(loan_id: int) -> None:
-    """Mark loan as *completed* if total payments cover the payable amount."""
-    loan = db.get_loan_by_id(loan_id)
-    if not loan or loan["status"] not in ("active", "pending"):
-        return
-    principal = float(loan.get("approved_amount") or loan["requested_amount"])
-    rate = float(loan.get("interest_rate") or 0)
-    term = int(loan.get("term_months") or 1)
-    total_payable = principal * (1 + rate / 100 * term)
-    total_paid = db.get_total_paid(loan_id)
-    if total_paid >= total_payable:
-        db.execute("UPDATE loans SET status='completed' WHERE id=?", (loan_id,))
-        log.info("Loan id=%d marked completed (paid=%.2f).", loan_id, total_paid)
+    def reject_loan(self, loan_id: int, actor_id: Optional[int]) -> Tuple[bool, str]:
+        loan = self.get_loan(loan_id)
+        if not loan:
+            return False, "Loan not found"
+        self.db.update_loan_status(loan_id, "rejected")
+        self.db.log_action(actor_id, "REJECT_LOAN", "loans", loan_id)
+        return True, "Loan rejected"
 
+    # ------------------------------------------------------------------ #
+    # Repayments
+    # ------------------------------------------------------------------ #
 
-def get_loan_summary(loan_id: int) -> Dict:
-    """Return a summary dict for a loan including balance and payment status.
+    def list_repayments(self, loan_id: Optional[int] = None) -> List[Repayment]:
+        return [Repayment.from_row(r) for r in self.db.list_repayments(loan_id)]
 
-    Args:
-        loan_id: Loan PK.
+    def record_repayment(self, loan_id: int, amount: float, payment_date: str,
+                         payment_method: str, reference: Optional[str],
+                         notes: Optional[str], recorded_by: Optional[int]) -> Tuple[bool, str]:
+        """Record a repayment and update outstanding balance."""
+        loan = self.get_loan(loan_id)
+        if not loan:
+            return False, "Loan not found"
+        if loan.status not in ("active", "approved"):
+            return False, f"Cannot record payment for loan with status '{loan.status}'"
+        if amount <= 0:
+            return False, "Payment amount must be positive"
 
-    Returns:
-        Dict with keys: loan, repayments, total_paid, balance, status.
-    """
-    loan = db.get_loan_by_id(loan_id)
-    if not loan:
-        return {}
-    principal = float(loan.get("approved_amount") or loan["requested_amount"])
-    rate = float(loan.get("interest_rate") or 0)
-    term = int(loan.get("term_months") or 1)
-    total_payable = principal * (1 + rate / 100 * term)
-    total_paid = db.get_total_paid(loan_id)
-    repayments = db.get_repayments_for_loan(loan_id)
-    return {
-        "loan": dict(loan),
-        "repayments": repayments,
-        "total_payable": total_payable,
-        "total_paid": total_paid,
-        "balance": max(total_payable - total_paid, 0),
-        "status": loan["status"],
-    }
+        rep_id = self.db.create_repayment(
+            loan_id, amount, payment_date, payment_method, reference, notes, recorded_by
+        )
+        # Recalculate outstanding
+        total_paid = self.db.sum_repayments(loan_id)
+        total_payable = Loan.from_row(self.db.get_loan_by_id(loan_id)).total_payable()
+        new_balance = max(0.0, total_payable - total_paid)
+        self.db.update_outstanding_balance(loan_id, new_balance)
+
+        # Auto-close if fully paid
+        if new_balance == 0.0:
+            self.db.update_loan_status(loan_id, "closed")
+            self.db.log_action(recorded_by, "CLOSE_LOAN", "loans", loan_id, "Fully repaid")
+
+        self.db.log_action(recorded_by, "RECORD_REPAYMENT", "repayments", rep_id,
+                           f"LoanID:{loan_id} Amt:{amount} Date:{payment_date}")
+        return True, f"Payment of {amount:,.2f} recorded"
+
+    def get_loan_summary(self, loan_id: int) -> Optional[Dict]:
+        """Return a dict with loan + repayment summary."""
+        loan = self.get_loan(loan_id)
+        if not loan:
+            return None
+        repayments = self.list_repayments(loan_id)
+        total_paid = sum(r.amount for r in repayments)
+        return {
+            "loan": loan,
+            "repayments": repayments,
+            "total_paid": total_paid,
+            "outstanding": loan.outstanding_balance or 0.0,
+            "repayment_count": len(repayments),
+        }

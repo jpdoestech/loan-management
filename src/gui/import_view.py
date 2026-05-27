@@ -1,466 +1,397 @@
-"""Import dialog – CSV / Excel bulk import with column mapping, preview,
-fuzzy employee matching, and dry-run / commit.
-"""
+"""Import dialog — file selection, column mapping, fuzzy review, dry-run/commit."""
 from __future__ import annotations
-
+import os
 import threading
 import tkinter as tk
-from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, List, Optional
+from tkinter import ttk, filedialog, messagebox
+from typing import Dict, List, Optional
 
-from src.data import db_manager as db
-from src.gui.dialogs import show_error, show_info
-from src.services import auth_service
-from src.services.import_service import (
-    ImportRowResult, ImportService,
-    STATUS_MATCHED, STATUS_UNMATCHED, STATUS_ERROR, STATUS_VALID,
-)
-from src.utils.logger import get_logger
-
-log = get_logger(__name__)
-
-# Model fields available for mapping
-LOAN_FIELDS = [
-    "employee_name", "employee_code", "requested_amount", "interest_rate",
-    "term_months", "purpose", "application_date", "reference_number",
-    "status", "notes",
-]
-REPAYMENT_FIELDS = [
-    "employee_name", "employee_code", "loan_reference", "loan_id",
-    "payment_date", "amount", "payment_method", "reference", "notes",
-]
+from ..data.db_manager import DBManager
+from ..services.auth_service import AuthService
+from ..services.import_service import ImportRowResult, ImportService
+from .dialogs import show_error, show_info
 
 
 class ImportView(tk.Toplevel):
-    """Multi-step import wizard.
+    """Multi-step import dialog window."""
 
-    Args:
-        master:    Parent widget.
-        threshold: Default fuzzy match threshold (configurable).
-    """
+    STEPS = ("1. File", "2. Map Columns", "3. Preview & Match", "4. Import")
 
-    def __init__(self, master: tk.Misc, threshold: float = 89.0) -> None:
-        super().__init__(master)
-        self.title("Bulk Import – Cash Advances / Repayments")
-        self.geometry("1050x700")
+    def __init__(self, parent, db: DBManager, auth: AuthService):
+        super().__init__(parent)
+        self.db = db
+        self.auth = auth
+        self.title("Import Loans / Repayments")
+        self.geometry("900x620")
+        self.resizable(True, True)
         self.grab_set()
 
-        self._threshold = threshold
-        self._file_path: Optional[str] = None
-        self._file_columns: List[str] = []
-        self._mapping: Dict[str, str] = {}  # file_col -> model_field
+        # State
+        self._file_path: str = ""
+        self._headers: List[str] = []
+        self._raw_rows: List[Dict] = []
+        self._mapping: Dict[str, Optional[str]] = {}
         self._results: List[ImportRowResult] = []
-        self._import_type = tk.StringVar(value="loan")
-        self._sheet_var = tk.StringVar()
-        self._sheet_names: List[str] = []
+        self._import_type = "loan"
+        self._threshold = 89.0
 
-        self._build_ui()
+        cfg = db.get_import_settings()
+        self._threshold = float(cfg.get("fuzzy_threshold", 89.0))
+        self._svc = ImportService(db, self._threshold)
 
-    # ── Layout ────────────────────────────────────────────────────────────────
+        self._build()
+        self._show_step(0)
 
-    def _build_ui(self) -> None:
-        nb = ttk.Notebook(self)
-        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._nb = nb
+    # ------------------------------------------------------------------ #
+    # Layout
+    # ------------------------------------------------------------------ #
 
-        self._tab_file = ttk.Frame(nb, padding=10)
-        self._tab_map = ttk.Frame(nb, padding=10)
-        self._tab_preview = ttk.Frame(nb, padding=10)
-        self._tab_review = ttk.Frame(nb, padding=10)
+    def _build(self):
+        # Step indicator
+        step_bar = ttk.Frame(self, relief=tk.GROOVE)
+        step_bar.pack(fill=tk.X, padx=0, pady=0)
+        self._step_labels: List[ttk.Label] = []
+        for i, s in enumerate(self.STEPS):
+            lbl = ttk.Label(step_bar, text=s, padding=(12, 6), relief=tk.FLAT,
+                            anchor=tk.CENTER)
+            lbl.pack(side=tk.LEFT, expand=True, fill=tk.X)
+            self._step_labels.append(lbl)
 
-        nb.add(self._tab_file, text="1 · File")
-        nb.add(self._tab_map, text="2 · Map Columns")
-        nb.add(self._tab_preview, text="3 · Preview & Validate")
-        nb.add(self._tab_review, text="4 · Review & Import")
+        # Content notebook (hidden tabs, driven by step buttons)
+        self._nb = ttk.Notebook(self)
+        self._nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self._nb.configure(takefocus=False)
 
-        self._build_file_tab()
-        self._build_map_tab()
-        self._build_preview_tab()
-        self._build_review_tab()
+        self._page_file = ttk.Frame(self._nb)
+        self._page_map = ttk.Frame(self._nb)
+        self._page_preview = ttk.Frame(self._nb)
+        self._page_result = ttk.Frame(self._nb)
+        for pg in (self._page_file, self._page_map, self._page_preview, self._page_result):
+            self._nb.add(pg)
+        self._nb.tab(0, state="normal")
 
-    # ── Tab 1: File selection ─────────────────────────────────────────────────
+        # Bottom nav
+        nav = ttk.Frame(self)
+        nav.pack(fill=tk.X, padx=8, pady=6)
+        self._back_btn = ttk.Button(nav, text="◀ Back", command=self._back, state=tk.DISABLED)
+        self._back_btn.pack(side=tk.LEFT)
+        self._next_btn = ttk.Button(nav, text="Next ▶", command=self._next)
+        self._next_btn.pack(side=tk.RIGHT)
+        self._dry_btn = ttk.Button(nav, text="🔍 Dry Run", command=self._dry_run)
+        self._import_btn = ttk.Button(nav, text="✔ Import", command=self._commit)
+        self._status_var = tk.StringVar()
+        ttk.Label(nav, textvariable=self._status_var).pack(side=tk.LEFT, padx=12)
 
-    def _build_file_tab(self) -> None:
-        f = self._tab_file
+        self._current_step = 0
+        self._build_step_file()
+        self._build_step_map()
+        self._build_step_preview()
+        self._build_step_result()
 
-        ttk.Label(f, text="Import Type:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        type_frame = ttk.Frame(f)
-        type_frame.grid(row=0, column=1, sticky=tk.W)
-        ttk.Radiobutton(type_frame, text="Cash Advance / Loan",
-                        variable=self._import_type, value="loan").pack(side=tk.LEFT)
-        ttk.Radiobutton(type_frame, text="Repayment / Payment",
-                        variable=self._import_type, value="repayment").pack(side=tk.LEFT, padx=10)
+    # ------------------------------------------------------------------ #
+    # Step 1 — File selection
+    # ------------------------------------------------------------------ #
 
-        ttk.Label(f, text="File:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        file_frame = ttk.Frame(f)
-        file_frame.grid(row=1, column=1, sticky=tk.EW)
+    def _build_step_file(self):
+        f = self._page_file
+        ttk.Label(f, text="Select import file and options",
+                  font=("Segoe UI", 11, "bold")).pack(pady=(16, 8))
+
+        row = ttk.Frame(f); row.pack(pady=4)
         self._file_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self._file_var, width=55, state="readonly").pack(side=tk.LEFT)
-        ttk.Button(file_frame, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(row, textvariable=self._file_var, width=50).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="Browse…", command=self._browse).pack(side=tk.LEFT)
 
-        ttk.Label(f, text="Sheet (XLSX):").grid(row=2, column=0, sticky=tk.W, pady=4)
-        self._sheet_cb = ttk.Combobox(f, textvariable=self._sheet_var, state="readonly", width=30)
-        self._sheet_cb.grid(row=2, column=1, sticky=tk.W)
+        row2 = ttk.Frame(f); row2.pack(pady=8)
+        ttk.Label(row2, text="Import type:").pack(side=tk.LEFT, padx=4)
+        self._type_var = tk.StringVar(value="loan")
+        ttk.Radiobutton(row2, text="Loans / Cash Advances", variable=self._type_var,
+                        value="loan").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(row2, text="Repayments", variable=self._type_var,
+                        value="repayment").pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(f, text="Fuzzy Match Threshold (%):").grid(row=3, column=0, sticky=tk.W, pady=4)
-        self._threshold_var = tk.DoubleVar(value=self._threshold)
-        ttk.Spinbox(f, from_=50, to=100, increment=1,
-                    textvariable=self._threshold_var, width=8).grid(row=3, column=1, sticky=tk.W)
+        row3 = ttk.Frame(f); row3.pack(pady=4)
+        ttk.Label(row3, text="Fuzzy threshold (%):").pack(side=tk.LEFT, padx=4)
+        self._thresh_var = tk.StringVar(value=str(self._threshold))
+        ttk.Entry(row3, textvariable=self._thresh_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(row3, text="(0-100; default 89)", foreground="gray").pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(f, text="Load File & Detect Columns →",
-                   command=self._load_file).grid(row=4, column=1, sticky=tk.W, pady=10)
-        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="Supported formats: CSV (.csv) and Excel (.xlsx)",
+                  foreground="gray").pack(pady=(12, 0))
 
-    def _browse(self) -> None:
+    def _browse(self):
         path = filedialog.askopenfilename(
-            filetypes=[("CSV / Excel", "*.csv *.xlsx *.xls"), ("All files", "*.*")]
-        )
+            filetypes=[("CSV/Excel", "*.csv *.xlsx"), ("CSV", "*.csv"),
+                       ("Excel", "*.xlsx"), ("All", "*.*")])
         if path:
-            self._file_path = path
             self._file_var.set(path)
-            # detect sheets for xlsx
-            if path.lower().endswith((".xlsx", ".xls")):
-                try:
-                    names = ImportService.get_sheet_names(path)
-                    self._sheet_names = names
-                    self._sheet_cb["values"] = names
-                    self._sheet_var.set(names[0] if names else "")
-                except Exception:
-                    pass
 
-    def _load_file(self) -> None:
-        if not self._file_path:
-            show_error("No file", "Please select a file first.")
-            return
-        sheet_idx = 0
-        if self._sheet_var.get() and self._sheet_names:
-            try:
-                sheet_idx = self._sheet_names.index(self._sheet_var.get())
-            except ValueError:
-                pass
-        try:
-            cols = ImportService.detect_columns(self._file_path, sheet_index=sheet_idx)
-            self._file_columns = cols
-            self._build_mapping_ui(cols)
-            self._nb.select(1)
-        except Exception as exc:
-            show_error("Load Error", str(exc))
+    # ------------------------------------------------------------------ #
+    # Step 2 — Column mapping
+    # ------------------------------------------------------------------ #
 
-    # ── Tab 2: Column mapping ─────────────────────────────────────────────────
+    def _build_step_map(self):
+        f = self._page_map
+        ttk.Label(f, text="Map file columns to model fields",
+                  font=("Segoe UI", 11, "bold")).pack(pady=(16, 8))
+        self._map_frame = ttk.Frame(f)
+        self._map_frame.pack(fill=tk.BOTH, expand=True, padx=16)
+        self._map_combos: Dict[str, ttk.Combobox] = {}
 
-    def _build_map_tab(self) -> None:
-        ttk.Label(self._tab_map,
-                  text="Map each file column to a model field (or leave blank to ignore).").pack(anchor=tk.W)
-        self._map_scroll = ttk.Frame(self._tab_map)
-        self._map_scroll.pack(fill=tk.BOTH, expand=True)
-        self._map_vars: Dict[str, tk.StringVar] = {}
+    def _populate_mapping(self):
+        for w in self._map_frame.winfo_children():
+            w.destroy()
+        self._map_combos.clear()
+        itype = self._type_var.get()
+        field_map = (ImportService.LOAN_FIELDS if itype == "loan"
+                     else ImportService.REPAYMENT_FIELDS)
+        auto = self._svc.auto_map_columns(self._headers, itype)
+        options = ["(skip)"] + self._headers
 
-        ttk.Button(self._tab_map, text="Validate & Preview →",
-                   command=self._run_preview).pack(anchor=tk.E, pady=6)
+        for row_i, (field, _) in enumerate(field_map.items()):
+            ttk.Label(self._map_frame,
+                      text=field.replace("_", " ").title() + ":").grid(
+                row=row_i, column=0, sticky=tk.W, pady=3, padx=(0, 12))
+            var = tk.StringVar(value=auto.get(field) or "(skip)")
+            cb = ttk.Combobox(self._map_frame, textvariable=var,
+                              values=options, state="readonly", width=28)
+            cb.grid(row=row_i, column=1, sticky=tk.W, pady=3)
+            self._map_combos[field] = cb
 
-    def _build_mapping_ui(self, file_cols: List[str]) -> None:
-        for child in self._map_scroll.winfo_children():
-            child.destroy()
-        self._map_vars.clear()
+    # ------------------------------------------------------------------ #
+    # Step 3 — Preview & fuzzy match review
+    # ------------------------------------------------------------------ #
 
-        import_type = self._import_type.get()
-        model_fields = [""] + (LOAN_FIELDS if import_type == "loan" else REPAYMENT_FIELDS)
+    def _build_step_preview(self):
+        f = self._page_preview
+        ttk.Label(f, text="Preview — review validation and employee matching",
+                  font=("Segoe UI", 11, "bold")).pack(pady=(12, 4))
 
-        header = ttk.Frame(self._map_scroll)
-        header.pack(fill=tk.X)
-        ttk.Label(header, text="File Column", width=28, font=("", 9, "bold")).pack(side=tk.LEFT)
-        ttk.Label(header, text="→  Model Field", font=("", 9, "bold")).pack(side=tk.LEFT)
+        # Summary bar
+        self._preview_summary = tk.StringVar()
+        ttk.Label(f, textvariable=self._preview_summary, foreground="#2980B9"
+                  ).pack(anchor=tk.W, padx=10)
 
-        canvas = tk.Canvas(self._map_scroll, height=350)
-        scrollbar = ttk.Scrollbar(self._map_scroll, orient=tk.VERTICAL, command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Table
+        cols = ("Row", "Status", "Employee (raw)", "Matched Employee", "Score",
+                "Amount", "Errors / Warnings")
+        self._prev_tree = ttk.Treeview(f, columns=cols, show="headings", height=14)
+        widths = (40, 65, 160, 160, 55, 90, 260)
+        for col, w in zip(cols, widths):
+            self._prev_tree.heading(col, text=col)
+            self._prev_tree.column(col, width=w,
+                                   anchor=tk.CENTER if col in ("Row","Score") else tk.W)
+        vsb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self._prev_tree.yview)
+        self._prev_tree.configure(yscrollcommand=vsb.set)
+        self._prev_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=4)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=4)
 
-        for col in file_cols:
-            row_frame = ttk.Frame(inner)
-            row_frame.pack(fill=tk.X, pady=1)
-            ttk.Label(row_frame, text=col, width=28, anchor=tk.W).pack(side=tk.LEFT)
-            var = tk.StringVar()
-            # Auto-guess mapping
-            normalized = col.lower().replace(" ", "_")
-            all_fields = LOAN_FIELDS + REPAYMENT_FIELDS
-            if normalized in all_fields:
-                var.set(normalized)
-            cb = ttk.Combobox(row_frame, textvariable=var, values=model_fields,
-                              state="readonly", width=28)
-            cb.pack(side=tk.LEFT, padx=4)
-            self._map_vars[col] = var
+        # Tags
+        self._prev_tree.tag_configure("valid", foreground="#27AE60")
+        self._prev_tree.tag_configure("invalid", foreground="#E74C3C")
+        self._prev_tree.tag_configure("warning", foreground="#F39C12")
 
-    # ── Tab 3: Preview & Validate ─────────────────────────────────────────────
+        # Fix employee button
+        btn_bar = ttk.Frame(f)
+        btn_bar.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ttk.Button(btn_bar, text="🔧 Fix Employee for Selected Row",
+                   command=self._fix_employee).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_bar, text="↺ Re-validate", command=self._revalidate).pack(side=tk.LEFT)
 
-    def _build_preview_tab(self) -> None:
-        toolbar = ttk.Frame(self._tab_preview)
-        toolbar.pack(fill=tk.X)
-        ttk.Label(toolbar, text="Validation results – double-click a row to override employee.").pack(side=tk.LEFT)
-        self._preview_count_var = tk.StringVar()
-        ttk.Label(toolbar, textvariable=self._preview_count_var).pack(side=tk.RIGHT)
+    def _populate_preview(self):
+        self._prev_tree.delete(*self._prev_tree.get_children())
+        valid = sum(1 for r in self._results if r.is_valid)
+        invalid = len(self._results) - valid
+        self._preview_summary.set(
+            f"Total: {len(self._results)}   ✔ Valid: {valid}   ✗ Invalid/Unmatched: {invalid}")
+        for res in self._results:
+            top = res.match_suggestions[0] if res.match_suggestions else None
+            matched = top.employee_name if top else ("✔ matched" if res.employee_id else "—")
+            score = f"{top.score:.0f}%" if top else ""
+            amt_key = "requested_amount" if "requested_amount" in res.normalized else "amount"
+            amt = res.normalized.get(amt_key, "")
+            amt_str = f"{amt:,.2f}" if isinstance(amt, float) else str(amt)
+            msgs = "; ".join(res.errors + res.warnings)[:80]
+            tag = "valid" if res.is_valid else ("warning" if res.warnings and not res.errors else "invalid")
+            self._prev_tree.insert("", tk.END, iid=str(res.row_index),
+                                   tags=(tag,),
+                                   values=(res.row_index, res.status,
+                                           res.employee_name_raw[:30], matched, score,
+                                           amt_str, msgs))
 
-        cols = ("row", "status", "employee", "match_score", "errors", "warnings")
-        self._preview_tree = ttk.Treeview(self._tab_preview, columns=cols, show="headings", height=18)
-        widths = {"row": 40, "status": 90, "employee": 170, "match_score": 85, "errors": 260, "warnings": 260}
-        labels = {"row": "#", "status": "Status", "employee": "Matched Employee",
-                  "match_score": "Score %", "errors": "Errors", "warnings": "Warnings"}
-        for c in cols:
-            self._preview_tree.heading(c, text=labels[c])
-            self._preview_tree.column(c, width=widths[c], anchor=tk.W)
-        sy = ttk.Scrollbar(self._tab_preview, orient=tk.VERTICAL, command=self._preview_tree.yview)
-        self._preview_tree.configure(yscrollcommand=sy.set)
-        self._preview_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sy.pack(side=tk.RIGHT, fill=tk.Y)
-        self._preview_tree.bind("<Double-1>", self._override_employee)
-
-        # Row colour tags
-        self._preview_tree.tag_configure(STATUS_VALID, background="#d4edda")
-        self._preview_tree.tag_configure(STATUS_MATCHED, background="#d4edda")
-        self._preview_tree.tag_configure(STATUS_WARNING, background="#fff3cd")
-        self._preview_tree.tag_configure(STATUS_UNMATCHED, background="#fff3cd")
-        self._preview_tree.tag_configure(STATUS_ERROR, background="#f8d7da")
-
-        btn_bar = ttk.Frame(self._tab_preview)
-        btn_bar.pack(fill=tk.X, pady=4)
-        ttk.Button(btn_bar, text="← Back", command=lambda: self._nb.select(1)).pack(side=tk.LEFT)
-        ttk.Button(btn_bar, text="Proceed to Review →", command=lambda: self._nb.select(3)).pack(side=tk.RIGHT)
-
-
-    def _run_preview(self) -> None:
-        if not self._file_path:
-            return
-        mapping = {col: var.get() for col, var in self._map_vars.items() if var.get()}
-        self._mapping = mapping
-        self._threshold = self._threshold_var.get()
-
-        self._preview_count_var.set("⏳ Processing…")
-        import_type = self._import_type.get()
-        sheet_idx = 0
-        if self._sheet_var.get() and self._sheet_names:
-            try:
-                sheet_idx = self._sheet_names.index(self._sheet_var.get())
-            except ValueError:
-                pass
-
-        def _work() -> None:
-            try:
-                svc = ImportService(
-                    user_id=getattr(auth_service.get_current_user(), "id", None),
-                    threshold=self._threshold,
-                )
-                raw = svc.parse_file(
-                    self._file_path, import_type=import_type,
-                    column_mapping=mapping, sheet_index=sheet_idx,
-                )
-                results = svc.validate_and_match(raw, import_type=import_type)
-                self.after(0, lambda: self._show_preview(results))
-            except Exception as exc:
-                self.after(0, lambda: show_error("Parse Error", str(exc)))
-
-        threading.Thread(target=_work, daemon=True).start()
-        self._nb.select(2)
-
-    def _show_preview(self, results: List[ImportRowResult]) -> None:
-        self._results = results
-        self._preview_tree.delete(*self._preview_tree.get_children())
-        ok = sum(1 for r in results if r.status in (STATUS_VALID, STATUS_MATCHED))
-        errors = sum(1 for r in results if r.status == STATUS_ERROR)
-        unmatched = sum(1 for r in results if r.status == STATUS_UNMATCHED)
-        self._preview_count_var.set(
-            f"{len(results)} rows  ✅{ok}  ❌{errors}  ⚠️{unmatched} unmatched")
-
-        for res in results:
-            best = res.employee_matches[0] if res.employee_matches else None
-            emp_name = best.name if best else "—"
-            score = f"{best.score:.1f}%" if best else "—"
-            self._preview_tree.insert(
-                "", tk.END, iid=str(res.row_number),
-                values=(
-                    res.row_number, res.status, emp_name, score,
-                    "; ".join(res.errors), "; ".join(res.warnings),
-                ),
-                tags=(res.status,),
-            )
-
-    def _override_employee(self, _event: Any) -> None:
-        """Let user manually pick an employee for the selected row."""
-        sel = self._preview_tree.selection()
+    def _fix_employee(self):
+        sel = self._prev_tree.selection()
         if not sel:
-            return
-        row_num = int(sel[0])
-        result = next((r for r in self._results if r.row_number == row_num), None)
-        if not result:
-            return
-        dlg = _EmployeePickerDialog(self)
-        emp = dlg.selected
-        if emp:
-            result.selected_employee_id = emp["id"]
-            result.status = STATUS_MATCHED
-            # Update tree display
-            self._preview_tree.item(
-                str(row_num),
-                values=(
-                    row_num, STATUS_MATCHED,
-                    f"{emp['name']} (manual)", "100.0%",
-                    "; ".join(result.errors), "; ".join(result.warnings),
-                ),
-                tags=(STATUS_MATCHED,),
-            )
+            show_error("Select", "Select a row first."); return
+        row_idx = int(sel[0])
+        result = next((r for r in self._results if r.row_index == row_idx), None)
+        if not result: return
 
-    # ── Tab 4: Review & Import ────────────────────────────────────────────────
+        employees = self.db.list_employees()
+        items = [(e["id"], f"{e['name']} ({e.get('employee_code','')}) — {e.get('department','')}")
+                 for e in employees]
 
-    def _build_review_tab(self) -> None:
-        f = self._tab_review
-        ttk.Label(f, text="Review summary before importing.", font=("", 10, "bold")).pack(anchor=tk.W)
+        def on_select(emp_id):
+            result.employee_id = emp_id
+            result.status = "valid" if not result.errors else "invalid"
+            self._populate_preview()
 
-        self._summary_text = tk.Text(f, height=8, state=tk.DISABLED, font=("Consolas", 9))
-        self._summary_text.pack(fill=tk.X, pady=6)
+        from .dialogs import SearchableListDialog
+        SearchableListDialog(self, "Pick Employee", items, on_select)
 
-        opts = ttk.LabelFrame(f, text="Import Options", padding=8)
-        opts.pack(fill=tk.X, pady=4)
-        self._dry_run_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Dry-run only (preview without writing to database)",
-                        variable=self._dry_run_var).pack(anchor=tk.W)
+    def _revalidate(self):
+        self._status_var.set("Re-validating…")
+        self._build_mapping_dict()
+        threading.Thread(target=self._do_validate, daemon=True).start()
 
-        self._progress = ttk.Progressbar(f, mode="indeterminate")
-        self._progress.pack(fill=tk.X, pady=4)
+    # ------------------------------------------------------------------ #
+    # Step 4 — Result
+    # ------------------------------------------------------------------ #
 
-        self._result_text = tk.Text(f, height=10, state=tk.DISABLED, font=("Consolas", 9))
-        self._result_text.pack(fill=tk.BOTH, expand=True)
+    def _build_step_result(self):
+        f = self._page_result
+        self._result_text = tk.Text(f, wrap=tk.WORD, state=tk.DISABLED,
+                                    font=("Consolas", 10))
+        sb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self._result_text.yview)
+        self._result_text.configure(yscrollcommand=sb.set)
+        self._result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=10)
+        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
 
-        btn = ttk.Frame(f)
-        btn.pack(fill=tk.X)
-        ttk.Button(btn, text="← Back", command=lambda: self._nb.select(2)).pack(side=tk.LEFT)
-        self._import_btn = ttk.Button(btn, text="▶ Run Import", command=self._run_import)
-        self._import_btn.pack(side=tk.RIGHT)
-
-        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
-
-    def _on_tab_change(self, _event: Any) -> None:
-        if self._nb.index(self._nb.select()) == 3:
-            self._refresh_summary()
-
-    def _refresh_summary(self) -> None:
-        if not self._results:
-            return
-        total = len(self._results)
-        ok = sum(1 for r in self._results if r.status in (STATUS_VALID, STATUS_MATCHED))
-        errors = sum(1 for r in self._results if r.status == STATUS_ERROR)
-        unmatched = sum(1 for r in self._results if r.status == STATUS_UNMATCHED)
-        lines = [
-            f"File:      {self._file_path}",
-            f"Type:      {self._import_type.get()}",
-            f"Threshold: {self._threshold}%",
-            "",
-            f"Total rows:  {total}",
-            f"  ✅ Ready:     {ok}",
-            f"  ❌ Errors:    {errors}  (will be skipped)",
-            f"  ⚠️  Unmatched: {unmatched}  (will be skipped unless manually resolved)",
-            "",
-            "Dry-run is ON by default – uncheck to commit." if self._dry_run_var.get()
-            else "⚠️  DRY-RUN IS OFF – data WILL be written to the database.",
-        ]
-        self._summary_text.configure(state=tk.NORMAL)
-        self._summary_text.delete("1.0", tk.END)
-        self._summary_text.insert(tk.END, "\n".join(lines))
-        self._summary_text.configure(state=tk.DISABLED)
-
-    def _run_import(self) -> None:
-        if not self._results:
-            show_error("No data", "Please complete steps 1-3 first.")
-            return
-        dry_run = self._dry_run_var.get()
-        self._import_btn.configure(state=tk.DISABLED)
-        self._progress.start()
-
-        import_type = self._import_type.get()
-        file_name = Path(self._file_path or "unknown").name
-
-        def _work() -> None:
-            try:
-                svc = ImportService(
-                    user_id=getattr(auth_service.get_current_user(), "id", None),
-                    threshold=self._threshold,
-                )
-                summary = svc.commit_import(
-                    self._results, import_type=import_type,
-                    dry_run=dry_run, file_name=file_name,
-                )
-                self.after(0, lambda: self._show_result(summary))
-            except Exception as exc:
-                self.after(0, lambda: show_error("Import Error", str(exc)))
-            finally:
-                self.after(0, lambda: (self._progress.stop(),
-                                       self._import_btn.configure(state=tk.NORMAL)))
-
-        threading.Thread(target=_work, daemon=True).start()
-
-    def _show_result(self, summary: Dict) -> None:
-        lines = [
-            f"{'=== DRY RUN ===' if summary.get('dry_run') else '=== COMMITTED ==='}",
-            f"Type:      {summary.get('import_type')}",
-            f"File:      {summary.get('file_name')}",
-            f"Timestamp: {summary.get('timestamp')}",
-            "",
-            f"Total rows:  {summary.get('total')}",
-            f"Committed:   {summary.get('committed')}",
-            f"Skipped:     {summary.get('skipped')}",
-            f"Failed:      {summary.get('failed')}",
-            "",
-            f"Log file: {summary.get('log_path')}",
-        ]
+    def _show_result_text(self, text: str):
         self._result_text.configure(state=tk.NORMAL)
         self._result_text.delete("1.0", tk.END)
-        self._result_text.insert(tk.END, "\n".join(lines))
+        self._result_text.insert(tk.END, text)
         self._result_text.configure(state=tk.DISABLED)
-        if not summary.get("dry_run"):
-            show_info("Import Complete",
-                      f"Imported {summary.get('committed')} rows.\n"
-                      f"Log saved to:\n{summary.get('log_path')}")
 
+    # ------------------------------------------------------------------ #
+    # Navigation
+    # ------------------------------------------------------------------ #
 
-class _EmployeePickerDialog(tk.Toplevel):
-    """Search and select an employee manually."""
+    def _show_step(self, step: int):
+        self._current_step = step
+        self._nb.select(step)
+        for i, lbl in enumerate(self._step_labels):
+            lbl.configure(
+                background="#2980B9" if i == step else "",
+                foreground="white" if i == step else "black",
+            )
+        self._back_btn.configure(state=tk.NORMAL if step > 0 else tk.DISABLED)
+        # Show/hide import buttons only on step 3
+        if step == 3:
+            self._next_btn.pack_forget()
+            self._dry_btn.pack(side=tk.RIGHT, padx=4)
+            self._import_btn.pack(side=tk.RIGHT, padx=4)
+        else:
+            self._dry_btn.pack_forget()
+            self._import_btn.pack_forget()
+            self._next_btn.pack(side=tk.RIGHT)
+            self._next_btn.configure(
+                text="Finish" if step == len(self.STEPS) - 1 else "Next ▶")
 
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master)
-        self.title("Pick Employee")
-        self.grab_set()
-        self.geometry("420x380")
-        self.selected: Optional[Dict] = None
-        self._all: List[Dict] = db.get_all_employees()
+    def _next(self):
+        if self._current_step == 0:
+            if not self._load_file(): return
+            self._show_step(1)
+        elif self._current_step == 1:
+            self._build_mapping_dict()
+            self._status_var.set("Validating rows…")
+            self._next_btn.configure(state=tk.DISABLED)
+            threading.Thread(target=self._do_validate, daemon=True).start()
+        elif self._current_step == 2:
+            self._show_step(3)
+        elif self._current_step == 3:
+            self.destroy()
 
-        ttk.Label(self, text="Type to search:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._filter())
-        ttk.Entry(self, textvariable=self._search_var, width=45).pack(padx=10, pady=4)
+    def _back(self):
+        if self._current_step > 0:
+            self._show_step(self._current_step - 1)
 
-        self._lb = tk.Listbox(self, height=14)
-        self._lb.pack(fill=tk.BOTH, expand=True, padx=10)
-        self._lb.bind("<Double-1>", self._select)
+    # ------------------------------------------------------------------ #
+    # Business logic
+    # ------------------------------------------------------------------ #
 
-        ttk.Button(self, text="Select", command=self._select).pack(pady=6)
-        self._filter()
-        self.wait_window(self)
+    def _load_file(self) -> bool:
+        path = self._file_var.get().strip()
+        if not path or not os.path.exists(path):
+            show_error("File", "Please select a valid file."); return False
+        try:
+            self._threshold = float(self._thresh_var.get())
+        except ValueError:
+            self._threshold = 89.0
+        self._svc.threshold = self._threshold
+        self._svc.matcher.threshold = self._threshold
+        self._import_type = self._type_var.get()
+        self._file_path = path
+        try:
+            self._headers, self._raw_rows = self._svc.parse_file(path)
+        except Exception as e:
+            show_error("Parse Error", str(e)); return False
+        self._status_var.set(f"Loaded {len(self._raw_rows)} rows, {len(self._headers)} columns.")
+        self._populate_mapping()
+        return True
 
-    def _filter(self) -> None:
-        q = self._search_var.get().lower()
-        self._lb.delete(0, tk.END)
-        self._filtered: List[Dict] = []
-        for emp in self._all:
-            text = f"{emp.get('name','')} {emp.get('employee_code','') or ''}".lower()
-            if q in text:
-                self._lb.insert(tk.END, f"[{emp.get('employee_code','') or '—'}] {emp['name']}")
-                self._filtered.append(emp)
+    def _build_mapping_dict(self):
+        self._mapping = {
+            field: (cb.get() if cb.get() != "(skip)" else None)
+            for field, cb in self._map_combos.items()
+        }
 
-    def _select(self, _event: Any = None) -> None:
-        sel = self._lb.curselection()
-        if sel:
-            self.selected = self._filtered[sel[0]]
-        self.destroy()
+    def _do_validate(self):
+        try:
+            self._results = self._svc.validate_rows(
+                self._raw_rows, self._mapping, self._import_type)
+            self.after(0, self._on_validate_done)
+        except Exception as e:
+            self.after(0, lambda: show_error("Validation Error", str(e)))
+
+    def _on_validate_done(self):
+        self._populate_preview()
+        self._status_var.set(
+            f"Validated {len(self._results)} rows. "
+            f"Valid: {sum(1 for r in self._results if r.is_valid)}")
+        self._next_btn.configure(state=tk.NORMAL)
+        self._show_step(2)
+
+    def _dry_run(self):
+        summary = self._svc.dry_run_import(self._results, self._import_type)
+        text = (f"DRY RUN — No data was written.\n\n"
+                f"File: {self._file_path}\n"
+                f"Type: {summary.import_type}\n"
+                f"Total rows: {summary.total_rows}\n"
+                f"Would import: {summary.imported}\n"
+                f"Would skip/fail: {summary.skipped + summary.failed}\n\n"
+                f"Review the Preview tab to fix unmatched or invalid rows.")
+        self._show_result_text(text)
+        self._show_step(3)
+
+    def _commit(self):
+        valid = sum(1 for r in self._results if r.is_valid)
+        if not messagebox.askyesno("Confirm Import",
+                                   f"Import {valid} valid rows?\n"
+                                   f"({len(self._results) - valid} rows will be skipped)"):
+            return
+        uid = self.auth.current_user.id if self.auth.current_user else None
+        self._import_btn.configure(state=tk.DISABLED)
+        self._status_var.set("Importing…")
+
+        def do():
+            summary = self._svc.commit_import(
+                self._results, self._import_type, uid,
+                os.path.basename(self._file_path))
+            self.after(0, lambda: self._on_commit_done(summary))
+
+        threading.Thread(target=do, daemon=True).start()
+
+    def _on_commit_done(self, summary):
+        text = (f"IMPORT COMPLETE\n\n"
+                f"File: {summary.file_name}\n"
+                f"Type: {summary.import_type}\n"
+                f"Total rows: {summary.total_rows}\n"
+                f"✔ Imported: {summary.imported}\n"
+                f"⚠ Skipped: {summary.skipped}\n"
+                f"✗ Failed: {summary.failed}\n\n"
+                f"Log saved to:\n{summary.log_path}")
+        self._show_result_text(text)
+        self._show_step(3)
+        self._import_btn.configure(state=tk.NORMAL)
+        self._status_var.set(f"Done. Imported {summary.imported} rows.")

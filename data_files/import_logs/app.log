@@ -1,0 +1,141 @@
+2026-05-26 04:43:51 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:51 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:51 [INFO] ecam - Local DB initialized: /tmp/tmpa2rq08hy.db
+2026-05-26 04:43:52 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:43:53 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:43:53 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:53 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:53 [INFO] ecam - Local DB initialized: /tmp/tmpsekx59j3.db
+2026-05-26 04:43:53 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:43:54 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:54 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:54 [INFO] ecam - Local DB initialized: /tmp/tmp5v28zh_n.db
+2026-05-26 04:43:54 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:43:54 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:54 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:54 [INFO] ecam - Local DB initialized: /tmp/tmpvlvw67az.db
+2026-05-26 04:43:55 [WARNING] ecam - Login failed: unknown user 'nobody'
+2026-05-26 04:43:55 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:55 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:55 [INFO] ecam - Local DB initialized: /tmp/tmpll31t4rq.db
+2026-05-26 04:43:55 [WARNING] ecam - Login failed: bad password for 'testuser'
+2026-05-26 04:43:55 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:55 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:55 [INFO] ecam - Local DB initialized: /tmp/tmpxuulws_a.db
+2026-05-26 04:43:56 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmp1qj7dw2p.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpv__eo2ka.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpho_df9ns.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpk9t0_5sv.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpbvm95_2p.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmp_9v5_atb.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpo15suctb.db
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:56 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:56 [INFO] ecam - Local DB initialized: /tmp/tmpfld13hg1.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmp8fgn7dl6.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmpa3nxizln.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmp68sbhdn9.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmpbu656lb9.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmpevg8txh5.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmp4jgrf566.db
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:43:57 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:43:57 [INFO] ecam - Local DB initialized: /tmp/tmp447eiqxs.db
+2026-05-26 04:44:23 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:23 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:23 [INFO] ecam - Local DB initialized: /tmp/tmp61yezvxx.db
+2026-05-26 04:44:24 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:44:24 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:44:24 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:24 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:24 [INFO] ecam - Local DB initialized: /tmp/tmpg3dvfzn6.db
+2026-05-26 04:44:25 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:44:25 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:25 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:25 [INFO] ecam - Local DB initialized: /tmp/tmp57wx9b6k.db
+2026-05-26 04:44:26 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:44:26 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:26 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:26 [INFO] ecam - Local DB initialized: /tmp/tmpurdeclqt.db
+2026-05-26 04:44:26 [WARNING] ecam - Login failed: unknown user 'nobody'
+2026-05-26 04:44:26 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:26 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:26 [INFO] ecam - Local DB initialized: /tmp/tmp_3jfhkgy.db
+2026-05-26 04:44:27 [WARNING] ecam - Login failed: bad password for 'testuser'
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:27 [INFO] ecam - Local DB initialized: /tmp/tmp2f1avz2e.db
+2026-05-26 04:44:27 [INFO] ecam - User 'testuser' logged in (role=staff)
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:27 [INFO] ecam - Local DB initialized: /tmp/tmpcjunu_qo.db
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:27 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:27 [INFO] ecam - Local DB initialized: /tmp/tmppp3kdujs.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpsf3kvxa6.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpcc5djbst.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpxnsjwwh8.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmp8k69jwg8.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmps8ilbt1e.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpcpn4ix88.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpbd85wz07.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpdf0lmlcc.db
+2026-05-26 04:44:28 [INFO] ecam - Import log saved: /home/claude/eca/data_files/import_logs/import_loan_20260526_044428.csv
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmp3korqkq4.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpuu39k6hy.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpj74ecabx.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmper8w4ltu.db
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 001_init
+2026-05-26 04:44:28 [INFO] ecam - Applying migration 002_add_indexes
+2026-05-26 04:44:28 [INFO] ecam - Local DB initialized: /tmp/tmpo30p3gk7.db

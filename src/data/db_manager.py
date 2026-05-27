@@ -1,492 +1,465 @@
-"""Database access layer.
+"""Database manager — local SQLite mode and REST (Flask) client mode.
 
-Supports two modes:
-  1. **Local / Network-share** – connects directly to an SQLite file.
-  2. **Server (REST)** – sends HTTP requests to a Flask REST server; the
-     server owns the SQLite file and enforces role-based access.
+Usage (local):
+    db = DBManager()
+    db.initialize()
+    users = db.fetch_all("SELECT * FROM users")
 
-The public ``DBManager`` singleton is configured once at startup via
-:func:`configure` and then used throughout the application.
+Usage (REST):
+    db = DBManager(mode="rest", server_url="http://192.168.1.10:5000", token="secret")
+    db.initialize()
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-import threading
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import requests  # type: ignore
+from ..utils.logger import get_logger
 
-from src.utils.logger import get_logger
-
-log = get_logger(__name__)
+log = get_logger()
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
-_DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data_files" / "cash_advance.db"
-_DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-_local = threading.local()
+_DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data_files" / "ecam.db"
+_CONFIG_PATH = Path(__file__).parent.parent.parent / "data_files" / "config.json"
 
 
-# ─── Configuration dataclass ─────────────────────────────────────────────────
+class DBManager:
+    """Unified data access layer.
 
-class DBConfig:
-    """Holds runtime connection settings."""
+    Supports two modes controlled by ``config.json``:
+    - ``"local"``  — direct SQLite connection (WAL mode, supports SMB share path).
+    - ``"rest"``   — HTTP client that calls the Flask REST server.
+    """
 
     def __init__(
         self,
-        mode: str = "local",       # "local" | "server"
-        db_path: str = "",
-        server_url: str = "",
-        auth_token: str = "",
+        mode: str = "local",
+        db_path: Optional[str] = None,
+        server_url: Optional[str] = None,
+        token: Optional[str] = None,
     ) -> None:
         self.mode = mode
         self.db_path = db_path or str(_DEFAULT_DB_PATH)
-        self.server_url = server_url.rstrip("/")
-        self.auth_token = auth_token
+        self.server_url = server_url
+        self.token = token
+        self._conn: Optional[sqlite3.Connection] = None
 
+        # Load saved config if available
+        self._load_config()
 
-_config = DBConfig()
+    # ------------------------------------------------------------------ #
+    # Config persistence
+    # ------------------------------------------------------------------ #
 
+    def _load_config(self) -> None:
+        """Overlay saved config.json over constructor defaults."""
+        if _CONFIG_PATH.exists():
+            try:
+                cfg = json.loads(_CONFIG_PATH.read_text())
+                self.mode = cfg.get("mode", self.mode)
+                self.db_path = cfg.get("db_path", self.db_path)
+                self.server_url = cfg.get("server_url", self.server_url)
+                self.token = cfg.get("token", self.token)
+            except (json.JSONDecodeError, OSError):
+                pass
 
-def configure(cfg: DBConfig) -> None:
-    """Set the global DB configuration.
+    def save_config(self) -> None:
+        """Persist current connection settings to config.json."""
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cfg = {
+            "mode": self.mode,
+            "db_path": self.db_path,
+            "server_url": self.server_url,
+            "token": self.token,
+        }
+        _CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
-    Args:
-        cfg: :class:`DBConfig` instance.
-    """
-    global _config
-    _config = cfg
-    log.info("DBManager configured: mode=%s", cfg.mode)
-    if cfg.mode == "local":
-        _run_migrations(cfg.db_path)
+    # ------------------------------------------------------------------ #
+    # Initialisation
+    # ------------------------------------------------------------------ #
 
+    def initialize(self) -> None:
+        """Set up the DB (run migrations) or verify REST connectivity."""
+        if self.mode == "local":
+            self._local_initialize()
+        else:
+            self._rest_ping()
 
-# ─── Local SQLite helpers ─────────────────────────────────────────────────────
+    def _local_initialize(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = self._get_conn()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._run_migrations(conn)
+        log.info("Local DB initialized: %s", self.db_path)
 
-def _get_connection(db_path: str) -> sqlite3.Connection:
-    """Return a thread-local SQLite connection, creating it if needed."""
-    conn: Optional[sqlite3.Connection] = getattr(_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        _local.conn = conn
-    return conn
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS migrations "
+            "(id INTEGER PRIMARY KEY, version TEXT NOT NULL UNIQUE, "
+            "applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        applied = {r[0] for r in conn.execute("SELECT version FROM migrations")}
+        for sql_file in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+            version = sql_file.stem
+            if version not in applied:
+                log.info("Applying migration %s", version)
+                conn.executescript(sql_file.read_text())
+                conn.execute("INSERT INTO migrations (version) VALUES (?)", (version,))
+                conn.commit()
 
+    # ------------------------------------------------------------------ #
+    # Connection helpers (local mode)
+    # ------------------------------------------------------------------ #
 
-@contextmanager
-def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """Context manager that yields a connection and commits / rolls back.
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30,
+            )
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
 
-    Yields:
-        Active :class:`sqlite3.Connection`.
-    """
-    conn = _get_connection(_config.db_path)
-    try:
-        yield conn
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    # ------------------------------------------------------------------ #
+    # Query helpers (local mode)
+    # ------------------------------------------------------------------ #
+
+    def fetch_all(self, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        """Execute *sql* and return all rows as dicts."""
+        if self.mode == "rest":
+            return self._rest_query(sql, params)
+        cur = self._get_conn().execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def fetch_one(self, sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
+        """Execute *sql* and return the first row as a dict, or None."""
+        rows = self.fetch_all(sql, params)
+        return rows[0] if rows else None
+
+    def execute(self, sql: str, params: tuple = ()) -> int:
+        """Execute a DML statement; return last inserted row id."""
+        if self.mode == "rest":
+            return self._rest_execute(sql, params)
+        conn = self._get_conn()
+        cur = conn.execute(sql, params)
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        return cur.lastrowid or 0
 
+    def executemany(self, sql: str, param_list: List[tuple]) -> None:
+        """Execute *sql* for each tuple in *param_list* in one transaction."""
+        conn = self._get_conn()
+        conn.executemany(sql, param_list)
+        conn.commit()
 
-def _run_migrations(db_path: str) -> None:
-    """Apply pending SQL migration files in version order.
-
-    Args:
-        db_path: Path to the SQLite database file.
-    """
-    conn = _get_connection(db_path)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations "
-        "(version TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
-    )
-    conn.commit()
-
-    applied: set[str] = {
-        row[0] for row in conn.execute("SELECT version FROM schema_migrations;")
-    }
-
-    for sql_file in sorted(_MIGRATIONS_DIR.glob("*.sql")):
-        version = sql_file.stem[:3]
-        if version in applied:
-            continue
-        log.info("Applying migration %s …", sql_file.name)
-        sql = sql_file.read_text(encoding="utf-8")
+    def execute_transaction(self, statements: List[tuple]) -> None:
+        """Execute a list of (sql, params) tuples atomically."""
+        conn = self._get_conn()
         try:
-            conn.executescript(sql)
+            for sql, params in statements:
+                conn.execute(sql, params)
             conn.commit()
-            log.info("Migration %s applied.", version)
-        except Exception as exc:
-            log.error("Migration %s failed: %s", version, exc)
+        except Exception:
+            conn.rollback()
             raise
 
-
-# ─── Generic DAO helpers ─────────────────────────────────────────────────────
-
-def fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    """Execute a SELECT and return all rows as plain dicts.
-
-    Args:
-        sql:    SQL query string.
-        params: Positional query parameters.
-
-    Returns:
-        List of row dicts.
-    """
-    if _config.mode == "server":
-        return _rest_get("/query", {"sql": sql, "params": list(params)})
-    with get_db() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-
-
-def fetchone(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    """Execute a SELECT and return a single row dict or ``None``.
-
-    Args:
-        sql:    SQL query string.
-        params: Positional query parameters.
-
-    Returns:
-        Single row dict or ``None``.
-    """
-    rows = fetchall(sql, params)
-    return rows[0] if rows else None
-
-
-def execute(sql: str, params: tuple = ()) -> int:
-    """Execute a DML statement and return the last inserted/affected row id.
-
-    Args:
-        sql:    SQL statement.
-        params: Positional parameters.
-
-    Returns:
-        ``lastrowid`` for INSERT, ``rowcount`` for UPDATE/DELETE.
-    """
-    if _config.mode == "server":
-        result = _rest_post("/execute", {"sql": sql, "params": list(params)})
-        return result.get("lastrowid", 0)
-    with get_db() as conn:
-        cur = conn.execute(sql, params)
-        return cur.lastrowid or cur.rowcount
-
-
-def executemany(sql: str, param_list: List[tuple]) -> int:
-    """Execute a DML statement for a list of parameter sets.
-
-    Args:
-        sql:        SQL statement.
-        param_list: List of parameter tuples.
-
-    Returns:
-        Total rows affected.
-    """
-    if _config.mode == "server":
-        result = _rest_post("/executemany", {"sql": sql, "params": param_list})
-        return result.get("rowcount", 0)
-    with get_db() as conn:
-        cur = conn.executemany(sql, param_list)
-        return cur.rowcount
-
-
-# ─── REST client helpers ──────────────────────────────────────────────────────
-
-def _headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {_config.auth_token}",
-        "Content-Type": "application/json",
-    }
-
-
-def _rest_get(path: str, params: dict | None = None) -> Any:
-    url = f"{_config.server_url}{path}"
-    resp = requests.get(url, params=params, headers=_headers(), timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _rest_post(path: str, body: dict) -> Any:
-    url = f"{_config.server_url}{path}"
-    resp = requests.post(url, json=body, headers=_headers(), timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# ─── High-level DAO functions ─────────────────────────────────────────────────
-
-# ── Employees ─────────────────────────────────────────────────────────────────
-
-def get_all_employees(active_only: bool = True) -> List[Dict]:
-    """Return all employees, optionally filtering inactive ones."""
-    where = "WHERE e.is_active = 1" if active_only else ""
-    return fetchall(
-        f"""SELECT e.*, c.name AS client_name, b.name AS branch_name
-            FROM employees e
-            LEFT JOIN clients c ON e.client_id = c.id
-            LEFT JOIN branches b ON e.branch_id = b.id
-            {where}
-            ORDER BY e.name""",
-    )
-
-
-def get_employee_by_id(emp_id: int) -> Optional[Dict]:
-    return fetchone("SELECT * FROM employees WHERE id = ?", (emp_id,))
-
-
-def get_employee_by_code(code: str) -> Optional[Dict]:
-    return fetchone("SELECT * FROM employees WHERE employee_code = ?", (code,))
-
-
-def create_employee(data: Dict) -> int:
-    return execute(
-        """INSERT INTO employees
-               (employee_code, name, position, department, date_hired,
-                monthly_salary, phone, email, client_id, branch_id, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data.get("employee_code"), data["name"], data.get("position"),
-            data.get("department"), data.get("date_hired"),
-            data.get("monthly_salary"), data.get("phone"), data.get("email"),
-            data.get("client_id"), data.get("branch_id"), data.get("is_active", 1),
-        ),
-    )
-
-
-def update_employee(emp_id: int, data: Dict) -> int:
-    return execute(
-        """UPDATE employees SET employee_code=?, name=?, position=?,
-               department=?, date_hired=?, monthly_salary=?, phone=?,
-               email=?, client_id=?, branch_id=?, is_active=?
-           WHERE id=?""",
-        (
-            data.get("employee_code"), data["name"], data.get("position"),
-            data.get("department"), data.get("date_hired"),
-            data.get("monthly_salary"), data.get("phone"), data.get("email"),
-            data.get("client_id"), data.get("branch_id"), data.get("is_active", 1),
-            emp_id,
-        ),
-    )
-
-
-# ── Loans ─────────────────────────────────────────────────────────────────────
-
-def get_all_loans(status: Optional[str] = None) -> List[Dict]:
-    where = "WHERE l.status = ?" if status else ""
-    params = (status,) if status else ()
-    return fetchall(
-        f"""SELECT l.*, e.name AS employee_name, e.employee_code,
-                   b.name AS branch_name
-            FROM loans l
-            LEFT JOIN employees e ON l.employee_id = e.id
-            LEFT JOIN branches b ON l.branch_id = b.id
-            {where}
-            ORDER BY l.created_at DESC""",
-        params,
-    )
-
-
-def get_loan_by_id(loan_id: int) -> Optional[Dict]:
-    return fetchone(
-        """SELECT l.*, e.name AS employee_name FROM loans l
-           LEFT JOIN employees e ON l.employee_id = e.id
-           WHERE l.id = ?""",
-        (loan_id,),
-    )
-
-
-def get_loan_by_reference(ref: str) -> Optional[Dict]:
-    return fetchone("SELECT * FROM loans WHERE reference_number = ?", (ref,))
-
-
-def create_loan(data: Dict) -> int:
-    return execute(
-        """INSERT INTO loans
-               (reference_number, employee_id, branch_id, requested_amount,
-                approved_amount, interest_rate, term_months, purpose, status,
-                application_date, approval_date, first_payment_date,
-                processed_by, approved_by, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data.get("reference_number"), data["employee_id"],
-            data.get("branch_id"), data["requested_amount"],
-            data.get("approved_amount"), data.get("interest_rate", 0),
-            data.get("term_months", 1), data.get("purpose"),
-            data.get("status", "pending"), data.get("application_date"),
-            data.get("approval_date"), data.get("first_payment_date"),
-            data.get("processed_by"), data.get("approved_by"),
-            data.get("notes"),
-        ),
-    )
-
-
-def update_loan_status(loan_id: int, status: str, user_id: Optional[int] = None) -> int:
-    return execute(
-        "UPDATE loans SET status=?, approved_by=? WHERE id=?",
-        (status, user_id, loan_id),
-    )
-
-
-# ── Repayments ────────────────────────────────────────────────────────────────
-
-def get_repayments_for_loan(loan_id: int) -> List[Dict]:
-    return fetchall(
-        "SELECT * FROM repayments WHERE loan_id = ? ORDER BY payment_date",
-        (loan_id,),
-    )
-
-
-def create_repayment(data: Dict) -> int:
-    return execute(
-        """INSERT INTO repayments
-               (loan_id, payment_date, amount, payment_method, reference, notes, recorded_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data["loan_id"], data["payment_date"], data["amount"],
-            data.get("payment_method", "cash"), data.get("reference"),
-            data.get("notes"), data.get("recorded_by"),
-        ),
-    )
-
-
-def get_total_paid(loan_id: int) -> float:
-    row = fetchone(
-        "SELECT COALESCE(SUM(amount), 0) AS total FROM repayments WHERE loan_id = ?",
-        (loan_id,),
-    )
-    return float(row["total"]) if row else 0.0
-
-
-# ── Users ─────────────────────────────────────────────────────────────────────
-
-def get_user_by_username(username: str) -> Optional[Dict]:
-    return fetchone("SELECT * FROM users WHERE username = ?", (username,))
-
-
-def get_user_by_id(user_id: int) -> Optional[Dict]:
-    return fetchone("SELECT * FROM users WHERE id = ?", (user_id,))
-
-
-def get_all_users() -> List[Dict]:
-    return fetchall("SELECT * FROM users ORDER BY full_name")
-
-
-def create_user(data: Dict) -> int:
-    return execute(
-        """INSERT INTO users
-               (username, password_hash, full_name, email, role, branch_id, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data["username"], data["password_hash"], data["full_name"],
-            data.get("email"), data.get("role", "viewer"),
-            data.get("branch_id"), data.get("is_active", 1),
-        ),
-    )
-
-
-def update_user(user_id: int, data: Dict) -> None:
-    execute(
-        """UPDATE users SET full_name=?, email=?, role=?, branch_id=?, is_active=?
-           WHERE id=?""",
-        (
-            data["full_name"], data.get("email"), data.get("role", "viewer"),
-            data.get("branch_id"), data.get("is_active", 1), user_id,
-        ),
-    )
-
-
-def update_last_login(user_id: int) -> None:
-    execute(
-        "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?",
-        (user_id,),
-    )
-
-
-# ── Branches ──────────────────────────────────────────────────────────────────
-
-def get_all_branches(active_only: bool = True) -> List[Dict]:
-    where = "WHERE is_active = 1" if active_only else ""
-    return fetchall(f"SELECT * FROM branches {where} ORDER BY name")
-
-
-def create_branch(data: Dict) -> int:
-    return execute(
-        "INSERT INTO branches (name, address, phone, is_active) VALUES (?, ?, ?, ?)",
-        (data["name"], data.get("address"), data.get("phone"), data.get("is_active", 1)),
-    )
-
-
-def update_branch(branch_id: int, data: Dict) -> None:
-    execute(
-        "UPDATE branches SET name=?, address=?, phone=?, is_active=? WHERE id=?",
-        (data["name"], data.get("address"), data.get("phone"), data.get("is_active", 1), branch_id),
-    )
-
-
-# ── Clients ───────────────────────────────────────────────────────────────────
-
-def get_all_clients(active_only: bool = True) -> List[Dict]:
-    where = "WHERE is_active = 1" if active_only else ""
-    return fetchall(f"SELECT * FROM clients {where} ORDER BY name")
-
-
-def create_client(data: Dict) -> int:
-    return execute(
-        """INSERT INTO clients
-               (name, contact, phone, email, address, branch_id, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data["name"], data.get("contact"), data.get("phone"),
-            data.get("email"), data.get("address"),
-            data.get("branch_id"), data.get("is_active", 1),
-        ),
-    )
-
-
-def update_client(client_id: int, data: Dict) -> None:
-    execute(
-        """UPDATE clients SET name=?, contact=?, phone=?, email=?,
-               address=?, branch_id=?, is_active=? WHERE id=?""",
-        (
-            data["name"], data.get("contact"), data.get("phone"),
-            data.get("email"), data.get("address"),
-            data.get("branch_id"), data.get("is_active", 1), client_id,
-        ),
-    )
-
-
-# ── Audit Logs ────────────────────────────────────────────────────────────────
-
-def write_audit_log(
-    action: str,
-    user_id: Optional[int] = None,
-    table_name: Optional[str] = None,
-    record_id: Optional[int] = None,
-    detail: Optional[str] = None,
-    ip_address: Optional[str] = None,
-) -> None:
-    """Insert an audit log row.
-
-    Args:
-        action:     Action code (e.g. ``"IMPORT"``, ``"LOGIN"``).
-        user_id:    ID of the acting user.
-        table_name: Affected table.
-        record_id:  Affected record primary key.
-        detail:     JSON or freeform detail string.
-        ip_address: Client IP (optional).
-    """
-    try:
-        execute(
-            """INSERT INTO audit_logs
-                   (user_id, action, table_name, record_id, detail, ip_address)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, action, table_name, record_id, detail, ip_address),
+    # ------------------------------------------------------------------ #
+    # REST client helpers
+    # ------------------------------------------------------------------ #
+
+    def _rest_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+
+    def _rest_ping(self) -> None:
+        try:
+            import requests
+            r = requests.get(f"{self.server_url}/ping", headers=self._rest_headers(), timeout=5)
+            r.raise_for_status()
+            log.info("REST server reachable: %s", self.server_url)
+        except Exception as exc:
+            log.warning("REST server unreachable: %s", exc)
+
+    def _rest_query(self, sql: str, params: tuple) -> List[Dict[str, Any]]:
+        import requests
+        payload = {"sql": sql, "params": list(params)}
+        r = requests.post(
+            f"{self.server_url}/query",
+            json=payload,
+            headers=self._rest_headers(),
+            timeout=15,
         )
-    except Exception as exc:  # noqa: BLE001
-        log.error("Failed to write audit log: %s", exc)
+        r.raise_for_status()
+        return r.json().get("rows", [])
+
+    def _rest_execute(self, sql: str, params: tuple) -> int:
+        import requests
+        payload = {"sql": sql, "params": list(params)}
+        r = requests.post(
+            f"{self.server_url}/execute",
+            json=payload,
+            headers=self._rest_headers(),
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("lastrowid", 0)
+
+    # ------------------------------------------------------------------ #
+    # Convenience DAO helpers
+    # ------------------------------------------------------------------ #
+
+    # -- Users --
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        return self.fetch_one("SELECT * FROM users WHERE username=?", (username,))
+
+    def get_user_by_id(self, user_id: int) -> Optional[Dict]:
+        return self.fetch_one("SELECT * FROM users WHERE id=?", (user_id,))
+
+    def list_users(self) -> List[Dict]:
+        return self.fetch_all(
+            "SELECT u.*, b.name AS branch_name FROM users u "
+            "LEFT JOIN branches b ON u.branch_id=b.id ORDER BY u.username"
+        )
+
+    def create_user(self, username: str, password_hash: str, full_name: str,
+                    role: str, branch_id: Optional[int]) -> int:
+        return self.execute(
+            "INSERT INTO users (username, password_hash, full_name, role, branch_id) "
+            "VALUES (?,?,?,?,?)",
+            (username, password_hash, full_name, role, branch_id),
+        )
+
+    def update_user(self, user_id: int, full_name: str, role: str,
+                    branch_id: Optional[int], is_active: int) -> None:
+        self.execute(
+            "UPDATE users SET full_name=?, role=?, branch_id=?, is_active=?, "
+            "updated_at=datetime('now') WHERE id=?",
+            (full_name, role, branch_id, is_active, user_id),
+        )
+
+    def update_user_password(self, user_id: int, password_hash: str) -> None:
+        self.execute(
+            "UPDATE users SET password_hash=?, updated_at=datetime('now') WHERE id=?",
+            (password_hash, user_id),
+        )
+
+    def update_last_login(self, user_id: int) -> None:
+        self.execute(
+            "UPDATE users SET last_login=datetime('now') WHERE id=?", (user_id,)
+        )
+
+    # -- Branches --
+    def list_branches(self) -> List[Dict]:
+        return self.fetch_all("SELECT * FROM branches ORDER BY name")
+
+    def create_branch(self, name: str, code: str, address: Optional[str]) -> int:
+        return self.execute(
+            "INSERT INTO branches (name, code, address) VALUES (?,?,?)",
+            (name, code, address),
+        )
+
+    def update_branch(self, bid: int, name: str, code: str,
+                      address: Optional[str], is_active: int) -> None:
+        self.execute(
+            "UPDATE branches SET name=?, code=?, address=?, is_active=? WHERE id=?",
+            (name, code, address, is_active, bid),
+        )
+
+    # -- Clients --
+    def list_clients(self) -> List[Dict]:
+        return self.fetch_all(
+            "SELECT c.*, b.name AS branch_name FROM clients c "
+            "LEFT JOIN branches b ON c.branch_id=b.id ORDER BY c.name"
+        )
+
+    def create_client(self, name: str, code: Optional[str], email: Optional[str],
+                      phone: Optional[str], address: Optional[str],
+                      branch_id: Optional[int]) -> int:
+        return self.execute(
+            "INSERT INTO clients (name, code, email, phone, address, branch_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (name, code, email, phone, address, branch_id),
+        )
+
+    def update_client(self, cid: int, name: str, code: Optional[str], email: Optional[str],
+                      phone: Optional[str], address: Optional[str],
+                      branch_id: Optional[int], is_active: int) -> None:
+        self.execute(
+            "UPDATE clients SET name=?, code=?, email=?, phone=?, address=?, "
+            "branch_id=?, is_active=? WHERE id=?",
+            (name, code, email, phone, address, branch_id, is_active, cid),
+        )
+
+    # -- Employees --
+    def list_employees(self, active_only: bool = True) -> List[Dict]:
+        where = "WHERE e.is_active=1" if active_only else ""
+        return self.fetch_all(
+            f"SELECT e.*, b.name AS branch_name, c.name AS client_name "
+            f"FROM employees e "
+            f"LEFT JOIN branches b ON e.branch_id=b.id "
+            f"LEFT JOIN clients c ON e.client_id=c.id {where} ORDER BY e.name"
+        )
+
+    def get_employee_by_id(self, eid: int) -> Optional[Dict]:
+        return self.fetch_one(
+            "SELECT e.*, b.name AS branch_name FROM employees e "
+            "LEFT JOIN branches b ON e.branch_id=b.id WHERE e.id=?", (eid,)
+        )
+
+    def create_employee(self, name: str, employee_code: Optional[str], department: Optional[str],
+                        position: Optional[str], email: Optional[str], phone: Optional[str],
+                        branch_id: Optional[int], client_id: Optional[int]) -> int:
+        return self.execute(
+            "INSERT INTO employees (name, employee_code, department, position, "
+            "email, phone, branch_id, client_id) VALUES (?,?,?,?,?,?,?,?)",
+            (name, employee_code, department, position, email, phone, branch_id, client_id),
+        )
+
+    def update_employee(self, eid: int, name: str, employee_code: Optional[str],
+                        department: Optional[str], position: Optional[str],
+                        email: Optional[str], phone: Optional[str],
+                        branch_id: Optional[int], client_id: Optional[int],
+                        is_active: int) -> None:
+        self.execute(
+            "UPDATE employees SET name=?, employee_code=?, department=?, position=?, "
+            "email=?, phone=?, branch_id=?, client_id=?, is_active=?, "
+            "updated_at=datetime('now') WHERE id=?",
+            (name, employee_code, department, position, email, phone,
+             branch_id, client_id, is_active, eid),
+        )
+
+    # -- Loans --
+    def list_loans(self, status: Optional[str] = None,
+                   employee_id: Optional[int] = None) -> List[Dict]:
+        conditions = []
+        params: list = []
+        if status:
+            conditions.append("l.status=?")
+            params.append(status)
+        if employee_id:
+            conditions.append("l.employee_id=?")
+            params.append(employee_id)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return self.fetch_all(
+            f"SELECT l.*, e.name AS employee_name, e.employee_code, "
+            f"b.name AS branch_name FROM loans l "
+            f"LEFT JOIN employees e ON l.employee_id=e.id "
+            f"LEFT JOIN branches b ON l.branch_id=b.id "
+            f"{where} ORDER BY l.created_at DESC",
+            tuple(params),
+        )
+
+    def get_loan_by_id(self, loan_id: int) -> Optional[Dict]:
+        return self.fetch_one(
+            "SELECT l.*, e.name AS employee_name FROM loans l "
+            "LEFT JOIN employees e ON l.employee_id=e.id WHERE l.id=?",
+            (loan_id,),
+        )
+
+    def get_loan_by_reference(self, ref: str) -> Optional[Dict]:
+        return self.fetch_one(
+            "SELECT * FROM loans WHERE reference_number=?", (ref,)
+        )
+
+    def create_loan(self, loan_data: Dict) -> int:
+        return self.execute(
+            "INSERT INTO loans (reference_number, employee_id, requested_amount, "
+            "approved_amount, interest_rate, term_months, status, purpose, "
+            "application_date, due_date, outstanding_balance, branch_id, created_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                loan_data["reference_number"], loan_data["employee_id"],
+                loan_data["requested_amount"], loan_data.get("approved_amount"),
+                loan_data.get("interest_rate", 0.0), loan_data.get("term_months", 1),
+                loan_data.get("status", "pending"), loan_data.get("purpose"),
+                loan_data.get("application_date"), loan_data.get("due_date"),
+                loan_data.get("outstanding_balance"), loan_data.get("branch_id"),
+                loan_data.get("created_by"),
+            ),
+        )
+
+    def update_loan_status(self, loan_id: int, status: str,
+                           approved_amount: Optional[float] = None,
+                           approval_date: Optional[str] = None) -> None:
+        self.execute(
+            "UPDATE loans SET status=?, approved_amount=COALESCE(?,approved_amount), "
+            "approval_date=COALESCE(?,approval_date), updated_at=datetime('now') WHERE id=?",
+            (status, approved_amount, approval_date, loan_id),
+        )
+
+    def update_outstanding_balance(self, loan_id: int, balance: float) -> None:
+        self.execute(
+            "UPDATE loans SET outstanding_balance=?, updated_at=datetime('now') WHERE id=?",
+            (balance, loan_id),
+        )
+
+    # -- Repayments --
+    def list_repayments(self, loan_id: Optional[int] = None) -> List[Dict]:
+        where = "WHERE r.loan_id=?" if loan_id else ""
+        params = (loan_id,) if loan_id else ()
+        return self.fetch_all(
+            f"SELECT r.*, l.reference_number AS loan_reference, e.name AS employee_name "
+            f"FROM repayments r "
+            f"LEFT JOIN loans l ON r.loan_id=l.id "
+            f"LEFT JOIN employees e ON l.employee_id=e.id "
+            f"{where} ORDER BY r.payment_date DESC",
+            params,
+        )
+
+    def create_repayment(self, loan_id: int, amount: float, payment_date: str,
+                         payment_method: str, reference: Optional[str],
+                         notes: Optional[str], recorded_by: Optional[int]) -> int:
+        return self.execute(
+            "INSERT INTO repayments (loan_id, amount, payment_date, payment_method, "
+            "reference, notes, recorded_by) VALUES (?,?,?,?,?,?,?)",
+            (loan_id, amount, payment_date, payment_method, reference, notes, recorded_by),
+        )
+
+    def sum_repayments(self, loan_id: int) -> float:
+        row = self.fetch_one(
+            "SELECT COALESCE(SUM(amount),0) AS total FROM repayments WHERE loan_id=?",
+            (loan_id,),
+        )
+        return float(row["total"]) if row else 0.0
+
+    # -- Audit logs --
+    def log_action(self, user_id: Optional[int], action: str,
+                   table_name: Optional[str] = None, record_id: Optional[int] = None,
+                   details: Optional[str] = None) -> None:
+        self.execute(
+            "INSERT INTO audit_logs (user_id, action, table_name, record_id, details) "
+            "VALUES (?,?,?,?,?)",
+            (user_id, action, table_name, record_id, details),
+        )
+
+    def list_audit_logs(self, limit: int = 200) -> List[Dict]:
+        return self.fetch_all(
+            "SELECT a.*, u.username FROM audit_logs a "
+            "LEFT JOIN users u ON a.user_id=u.id "
+            "ORDER BY a.created_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    # -- Import settings --
+    def get_import_settings(self) -> Dict:
+        """Return persisted import settings from config."""
+        if _CONFIG_PATH.exists():
+            cfg = json.loads(_CONFIG_PATH.read_text())
+            return cfg.get("import_settings", {"fuzzy_threshold": 89.0})
+        return {"fuzzy_threshold": 89.0}
+
+    def save_import_settings(self, settings: Dict) -> None:
+        cfg: Dict = {}
+        if _CONFIG_PATH.exists():
+            cfg = json.loads(_CONFIG_PATH.read_text())
+        cfg["import_settings"] = settings
+        _CONFIG_PATH.write_text(json.dumps(cfg, indent=2))

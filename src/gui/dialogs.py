@@ -1,200 +1,152 @@
-"""Reusable dialog widgets for the application."""
+"""Reusable dialog helpers."""
 from __future__ import annotations
-
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk, messagebox
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+def ask_confirm(title: str, message: str) -> bool:
+    return messagebox.askyesno(title, message)
+
+
 def show_error(title: str, message: str) -> None:
-    """Show a standard error dialog."""
     messagebox.showerror(title, message)
 
 
 def show_info(title: str, message: str) -> None:
-    """Show a standard info dialog."""
     messagebox.showinfo(title, message)
 
 
-def ask_yes_no(title: str, message: str) -> bool:
-    """Show a yes/no dialog and return the result."""
-    return messagebox.askyesno(title, message)
-
-
 class FormDialog(tk.Toplevel):
-    """Generic modal form dialog.
+    """Generic modal form dialog with labeled fields."""
 
-    Subclass and override :meth:`_build_form` to add fields, then call
-    :meth:`get_data` to retrieve submitted values.
-
-    Args:
-        master: Parent widget.
-        title:  Window title.
-    """
-
-    def __init__(self, master: tk.Misc, title: str = "Form") -> None:
-        super().__init__(master)
+    def __init__(self, parent: tk.Widget, title: str,
+                 fields: List[Dict], on_save: Callable[[Dict], None],
+                 initial: Optional[Dict] = None) -> None:
+        super().__init__(parent)
         self.title(title)
         self.resizable(False, False)
         self.grab_set()
-        self._result: Optional[Dict] = None
+        self._fields = fields
+        self._on_save = on_save
         self._vars: Dict[str, tk.Variable] = {}
+        self._widgets: Dict[str, tk.Widget] = {}
+        self._build(initial or {})
 
-        frame = ttk.Frame(self, padding=16)
+    def _build(self, initial: Dict) -> None:
+        frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self._form_frame = ttk.Frame(frame)
-        self._form_frame.pack(fill=tk.BOTH, expand=True)
+        for row_idx, fld in enumerate(self._fields):
+            key = fld["key"]
+            label = fld.get("label", key.replace("_", " ").title())
+            ftype = fld.get("type", "entry")
 
-        self._build_form(self._form_frame)
+            ttk.Label(frame, text=f"{label}:").grid(
+                row=row_idx, column=0, sticky=tk.W, padx=(0, 10), pady=4)
 
-        sep = ttk.Separator(frame, orient=tk.HORIZONTAL)
-        sep.pack(fill=tk.X, pady=10)
+            if ftype == "combobox":
+                var = tk.StringVar(value=str(initial.get(key, fld.get("default", ""))))
+                cb = ttk.Combobox(frame, textvariable=var,
+                                  values=fld.get("values", []), state="readonly", width=26)
+                cb.grid(row=row_idx, column=1, pady=4, sticky=tk.W)
+                self._vars[key] = var
+                self._widgets[key] = cb
+            elif ftype == "text":
+                var = tk.StringVar(value=str(initial.get(key, "")))
+                txt = tk.Text(frame, width=28, height=3, wrap=tk.WORD)
+                txt.insert("1.0", initial.get(key, ""))
+                txt.grid(row=row_idx, column=1, pady=4)
+                self._widgets[key] = txt
+                self._vars[key] = var  # placeholder
+            elif ftype == "checkbutton":
+                var = tk.BooleanVar(value=bool(initial.get(key, fld.get("default", False))))
+                ttk.Checkbutton(frame, variable=var).grid(
+                    row=row_idx, column=1, pady=4, sticky=tk.W)
+                self._vars[key] = var
+            else:
+                var = tk.StringVar(value=str(initial.get(key, fld.get("default", ""))))
+                show = "•" if fld.get("password") else ""
+                entry = ttk.Entry(frame, textvariable=var, width=28, show=show)
+                entry.grid(row=row_idx, column=1, pady=4)
+                self._vars[key] = var
+                self._widgets[key] = entry
 
-        btn = ttk.Frame(frame)
-        btn.pack(fill=tk.X)
-        ttk.Button(btn, text="Save", command=self._on_save).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(self._fields), column=0, columnspan=2, pady=(16, 0))
+        ttk.Button(btn_frame, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        self.bind("<Return>", lambda _: self._save())
 
-        self._center()
-        self.wait_window(self)
+    def _save(self) -> None:
+        data: Dict[str, Any] = {}
+        for fld in self._fields:
+            key = fld["key"]
+            ftype = fld.get("type", "entry")
+            if ftype == "text":
+                w = self._widgets.get(key)
+                data[key] = w.get("1.0", tk.END).strip() if w else ""
+            elif ftype == "checkbutton":
+                data[key] = bool(self._vars[key].get())
+            else:
+                data[key] = self._vars[key].get()
+        self._on_save(data)
 
-    def _build_form(self, frame: ttk.Frame) -> None:
-        """Override to add labeled form rows."""
 
-    def _on_save(self) -> None:
-        """Collect variable values and close."""
-        self._result = {k: v.get() for k, v in self._vars.items()}
-        self.destroy()
+class SearchableListDialog(tk.Toplevel):
+    """A searchable list dialog for picking one item."""
 
-    def get_data(self) -> Optional[Dict]:
-        """Return submitted form data or ``None`` if cancelled."""
-        return self._result
-
-    def _add_field(
-        self,
-        frame: ttk.Frame,
-        label: str,
-        key: str,
-        row: int,
-        var_type: type = tk.StringVar,
-        widget_type: type = ttk.Entry,
-        options: Optional[List] = None,
-        default: Any = "",
-    ) -> tk.Variable:
-        """Add a labeled field to the form.
-
-        Args:
-            frame:       Container frame.
-            label:       Label text.
-            key:         Dict key for result.
-            row:         Grid row index.
-            var_type:    Tkinter variable class.
-            widget_type: Widget class to instantiate.
-            options:     For Combobox: list of values.
-            default:     Default variable value.
-
-        Returns:
-            The created Tkinter variable.
+    def __init__(self, parent: tk.Widget, title: str, items: List[Tuple[Any, str]],
+                 on_select: Callable[[Any], None]) -> None:
         """
-        ttk.Label(frame, text=label + ":").grid(row=row, column=0, sticky=tk.W, pady=3, padx=(0, 8))
-        var = var_type(value=default)
-        self._vars[key] = var
-        if widget_type == ttk.Combobox and options is not None:
-            w = ttk.Combobox(frame, textvariable=var, values=options, state="readonly", width=28)
-        elif widget_type == ttk.Entry:
-            w = ttk.Entry(frame, textvariable=var, width=30)
-        else:
-            w = widget_type(frame, textvariable=var, width=30)
-        w.grid(row=row, column=1, sticky=tk.EW, pady=3)
-        frame.columnconfigure(1, weight=1)
-        return var
-
-    def _center(self) -> None:
-        self.update_idletasks()
-        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
-
-
-class ConfirmDialog(tk.Toplevel):
-    """Simple yes/no confirmation dialog returning a boolean."""
-
-    def __init__(self, master: tk.Misc, title: str, message: str) -> None:
-        super().__init__(master)
+        Args:
+            items: List of (value, display_label) tuples.
+            on_select: Called with the selected value.
+        """
+        super().__init__(parent)
         self.title(title)
-        self.resizable(False, False)
         self.grab_set()
-        self.result = False
+        self._all_items = items
+        self._on_select = on_select
+        self._build()
 
-        ttk.Label(self, text=message, wraplength=400, padding=20).pack()
-        btn = ttk.Frame(self, padding=(0, 0, 10, 10))
-        btn.pack(fill=tk.X)
-        ttk.Button(btn, text="Yes", command=self._yes).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn, text="No", command=self.destroy).pack(side=tk.RIGHT)
+    def _build(self) -> None:
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
 
-        self.update_idletasks()
-        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
-        self.wait_window(self)
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._filter())
+        ttk.Entry(frame, textvariable=self._search_var, width=40).pack(fill=tk.X, pady=(0, 6))
 
-    def _yes(self) -> None:
-        self.result = True
-        self.destroy()
+        self._listbox = tk.Listbox(frame, width=50, height=15, selectmode=tk.SINGLE)
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._listbox.yview)
+        self._listbox.configure(yscrollcommand=sb.set)
+        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
+        self._filtered: List[Tuple[Any, str]] = list(self._all_items)
+        self._refresh_list()
 
-class SearchableCombobox(ttk.Frame):
-    """A combobox with a live filter as the user types.
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_frame, text="Select", command=self._select).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        self._listbox.bind("<Double-Button-1>", lambda _: self._select())
 
-    Args:
-        master:   Parent widget.
-        values:   Full list of string options.
-        **kwargs: Forwarded to the underlying ttk.Entry.
-    """
+    def _filter(self) -> None:
+        q = self._search_var.get().lower()
+        self._filtered = [(v, l) for v, l in self._all_items if q in l.lower()]
+        self._refresh_list()
 
-    def __init__(self, master: tk.Misc, values: List[str], **kwargs: Any) -> None:
-        super().__init__(master)
-        self._all_values = values
-        self._var = tk.StringVar()
-        self._var.trace_add("write", self._on_key)
-        self._entry = ttk.Entry(self, textvariable=self._var, **kwargs)
-        self._entry.pack(fill=tk.X)
-        self._listbox_frame: Optional[tk.Toplevel] = None
+    def _refresh_list(self) -> None:
+        self._listbox.delete(0, tk.END)
+        for _, label in self._filtered:
+            self._listbox.insert(tk.END, label)
 
-    def get(self) -> str:
-        """Return current text value."""
-        return self._var.get()
-
-    def set(self, value: str) -> None:
-        """Set the text value."""
-        self._var.set(value)
-
-    def _on_key(self, *_: Any) -> None:
-        text = self._var.get().lower()
-        filtered = [v for v in self._all_values if text in v.lower()]
-        self._show_dropdown(filtered[:10])
-
-    def _show_dropdown(self, items: List[str]) -> None:
-        if self._listbox_frame:
-            self._listbox_frame.destroy()
-        if not items:
+    def _select(self) -> None:
+        sel = self._listbox.curselection()
+        if not sel:
             return
-        self._listbox_frame = tk.Toplevel(self)
-        self._listbox_frame.wm_overrideredirect(True)
-        x = self._entry.winfo_rootx()
-        y = self._entry.winfo_rooty() + self._entry.winfo_height()
-        self._listbox_frame.geometry(f"+{x}+{y}")
-        lb = tk.Listbox(self._listbox_frame, height=min(len(items), 8))
-        lb.pack()
-        for item in items:
-            lb.insert(tk.END, item)
-        lb.bind("<<ListboxSelect>>", lambda e: self._select(lb))
-
-    def _select(self, lb: tk.Listbox) -> None:
-        sel = lb.curselection()
-        if sel:
-            self._var.set(lb.get(sel[0]))
-        if self._listbox_frame:
-            self._listbox_frame.destroy()
-            self._listbox_frame = None
+        value, _ = self._filtered[sel[0]]
+        self._on_select(value)
+        self.destroy()

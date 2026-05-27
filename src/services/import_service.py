@@ -1,519 +1,482 @@
-"""Import service: parsing, validation, fuzzy matching, commit/dry-run.
-
-Supports CSV and Excel (.xlsx) bulk import of:
-  - Loan / cash-advance applications
-  - Repayments / payments
-
-Typical usage::
-
-    svc = ImportService(user_id=1, threshold=89)
-    rows = svc.parse_file("advances.xlsx", import_type="loan")
-    results = svc.validate_and_match(rows)
-    # review results in GUI ...
-    report = svc.commit_import(results, dry_run=False)
-"""
+"""Import service — CSV/XLSX parsing, validation, fuzzy matching, commit/dry-run."""
 from __future__ import annotations
 
 import csv
-import io
 import json
 import os
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.data import db_manager as db
-from src.utils.fuzzy_match import FuzzyMatcher
-from src.utils.helpers import IMPORT_LOGS_DIR, timestamp_filename
-from src.utils.logger import get_logger
-from src.utils.validators import (
-    parse_date, parse_decimal, parse_int,
-    validate_loan_row, validate_repayment_row,
+from ..data.db_manager import DBManager
+from ..models.employee import Employee
+from ..models.loan import Loan
+from ..utils.fuzzy_match import FuzzyMatcher
+from ..utils.helpers import generate_reference, get_app_data_dir, ensure_dir
+from ..utils.logger import get_logger
+from ..utils.validators import (
+    parse_amount, parse_date, parse_positive_int, parse_rate, validate_required,
 )
 
-log = get_logger(__name__)
+log = get_logger()
+
+try:
+    import openpyxl
+    _OPENPYXL = True
+except ImportError:
+    _OPENPYXL = False
 
 
-# ─── Row result status constants ─────────────────────────────────────────────
-STATUS_VALID = "valid"
-STATUS_WARNING = "warning"
-STATUS_ERROR = "error"
-STATUS_MATCHED = "matched"
-STATUS_UNMATCHED = "unmatched"
-STATUS_IMPORTED = "imported"
-STATUS_SKIPPED = "skipped"
-STATUS_FAILED = "failed"
-
+# ------------------------------------------------------------------ #
+# Result types
+# ------------------------------------------------------------------ #
 
 @dataclass
-class EmployeeMatch:
-    """Represents a single fuzzy-match candidate."""
+class MatchSuggestion:
+    """A fuzzy match candidate for an employee name."""
     employee_id: int
-    name: str
+    employee_name: str
     employee_code: Optional[str]
     score: float
-    auto_selected: bool = False
 
 
 @dataclass
 class ImportRowResult:
-    """Holds parsed data, validation results, and match info for one row."""
-    row_number: int
-    raw: Dict[str, Any]
+    """Validation and matching result for a single import row."""
+    row_index: int
+    raw_data: Dict[str, Any]
     normalized: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    status: str = STATUS_VALID
-    employee_matches: List[EmployeeMatch] = field(default_factory=list)
-    selected_employee_id: Optional[int] = None
-    final_status: Optional[str] = None
-    final_message: str = ""
+    # Employee matching
+    employee_id: Optional[int] = None
+    employee_name_raw: str = ""
+    match_suggestions: List[MatchSuggestion] = field(default_factory=list)
+    auto_matched: bool = False
+    # Outcome
+    status: str = "pending"   # pending | valid | invalid | skipped | imported
 
+    @property
+    def is_valid(self) -> bool:
+        return len(self.errors) == 0 and self.employee_id is not None
+
+
+@dataclass
+class ImportSummary:
+    """Aggregate result from an import run."""
+    file_name: str
+    import_type: str
+    total_rows: int
+    imported: int = 0
+    skipped: int = 0
+    failed: int = 0
+    dry_run: bool = True
+    log_path: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+# ------------------------------------------------------------------ #
+# ImportService
+# ------------------------------------------------------------------ #
 
 class ImportService:
-    """Orchestrates the full import pipeline.
+    """Parses, validates, and commits bulk loan/repayment imports."""
 
-    Args:
-        user_id:    ID of the user performing the import.
-        threshold:  Fuzzy match threshold (0-100).
-    """
+    LOAN_FIELDS = {
+        "employee_name": ["employee_name", "employee", "name", "emp_name"],
+        "employee_code": ["employee_code", "emp_code", "code"],
+        "requested_amount": ["requested_amount", "amount", "loan_amount", "principal"],
+        "interest_rate": ["interest_rate", "rate", "interest"],
+        "term_months": ["term_months", "term", "months", "duration"],
+        "purpose": ["purpose", "description", "reason"],
+        "application_date": ["application_date", "date", "loan_date", "applied_date"],
+    }
 
-    def __init__(self, user_id: Optional[int] = None, threshold: float = 89.0) -> None:
-        self.user_id = user_id
-        self.threshold = threshold
-        self.matcher = FuzzyMatcher(threshold=threshold)
+    REPAYMENT_FIELDS = {
+        "employee_name": ["employee_name", "employee", "name", "emp_name"],
+        "loan_reference": ["loan_reference", "reference", "ref", "loan_ref", "reference_number"],
+        "amount": ["amount", "payment_amount", "paid_amount"],
+        "payment_date": ["payment_date", "date", "paid_date"],
+        "payment_method": ["payment_method", "method", "mode"],
+        "reference": ["reference", "receipt", "receipt_no"],
+        "notes": ["notes", "remarks", "note"],
+    }
 
-    # ── Parsing ───────────────────────────────────────────────────────────────
+    def __init__(self, db: DBManager, fuzzy_threshold: float = 89.0) -> None:
+        self.db = db
+        self.threshold = fuzzy_threshold
+        self.matcher = FuzzyMatcher(threshold=fuzzy_threshold)
+        self._employees: List[Dict] = []
 
-    def parse_file(
-        self,
-        file_path: str,
-        import_type: str,
-        column_mapping: Optional[Dict[str, str]] = None,
-        sheet_index: int = 0,
-    ) -> List[Dict[str, Any]]:
-        """Parse a CSV or XLSX file into a list of raw row dicts.
+    # ------------------------------------------------------------------ #
+    # File parsing
+    # ------------------------------------------------------------------ #
 
-        Args:
-            file_path:      Absolute path to the import file.
-            import_type:    ``"loan"`` or ``"repayment"``.
-            column_mapping: Maps file column headers to model field names.
-            sheet_index:    XLSX sheet index (0-based).
+    def parse_file(self, file_path: str, sheet_index: int = 0) -> Tuple[List[str], List[Dict]]:
+        """Parse a CSV or XLSX file.
 
         Returns:
-            List of raw row dicts with file-column keys (or mapped keys).
+            (headers, rows) where rows are dicts keyed by header.
         """
-        path = Path(file_path)
-        ext = path.suffix.lower()
+        ext = os.path.splitext(file_path)[1].lower()
         if ext == ".csv":
-            rows = self._parse_csv(path)
+            return self._parse_csv(file_path)
         elif ext in (".xlsx", ".xls"):
-            rows = self._parse_xlsx(path, sheet_index=sheet_index)
+            return self._parse_excel(file_path, sheet_index)
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
-        if column_mapping:
-            rows = [self._apply_mapping(r, column_mapping) for r in rows]
-
-        log.info("Parsed %d rows from %s (type=%s).", len(rows), path.name, import_type)
-        return rows
-
-    def _parse_csv(self, path: Path) -> List[Dict]:
-        """Read CSV rows using Python's csv module."""
-        rows = []
-        with path.open(newline="", encoding="utf-8-sig") as fh:
+    def _parse_csv(self, path: str) -> Tuple[List[str], List[Dict]]:
+        rows: List[Dict] = []
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
             # Sniff delimiter
-            sample = fh.read(4096)
-            fh.seek(0)
+            sample = f.read(4096)
+            f.seek(0)
             try:
                 dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
             except csv.Error:
                 dialect = csv.excel
-            reader = csv.DictReader(fh, dialect=dialect)
+            reader = csv.DictReader(f, dialect=dialect)
+            headers = reader.fieldnames or []
             for row in reader:
                 rows.append(dict(row))
-        return rows
+        return list(headers), rows
 
-    def _parse_xlsx(self, path: Path, sheet_index: int = 0) -> List[Dict]:
-        """Read XLSX rows using openpyxl."""
-        try:
-            import openpyxl  # type: ignore
-        except ImportError as exc:
-            raise ImportError("openpyxl is required for Excel imports.") from exc
-
-        wb = openpyxl.load_workbook(path, data_only=True)
+    def _parse_excel(self, path: str, sheet_index: int = 0) -> Tuple[List[str], List[Dict]]:
+        if not _OPENPYXL:
+            raise ImportError("openpyxl is required for Excel import. Install it with: pip install openpyxl")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.worksheets[sheet_index]
         rows_iter = ws.iter_rows(values_only=True)
-        headers = [str(h).strip() if h is not None else "" for h in next(rows_iter, [])]
-        result = []
-        for row_vals in rows_iter:
-            if all(v is None for v in row_vals):
+        headers = [str(h or "").strip() for h in next(rows_iter, [])]
+        rows = []
+        for raw_row in rows_iter:
+            if all(v is None for v in raw_row):
                 continue
-            result.append({h: v for h, v in zip(headers, row_vals)})
+            rows.append(dict(zip(headers, [v for v in raw_row])))
+        wb.close()
+        return headers, rows
+
+    # ------------------------------------------------------------------ #
+    # Column auto-mapping
+    # ------------------------------------------------------------------ #
+
+    def auto_map_columns(self, headers: List[str],
+                         import_type: str = "loan") -> Dict[str, Optional[str]]:
+        """Return {model_field: file_column | None} auto-detected mapping."""
+        field_map = self.LOAN_FIELDS if import_type == "loan" else self.REPAYMENT_FIELDS
+        headers_lower = [h.lower().strip() for h in headers]
+        mapping: Dict[str, Optional[str]] = {}
+        for model_field, aliases in field_map.items():
+            found = None
+            for alias in aliases:
+                try:
+                    idx = headers_lower.index(alias.lower())
+                    found = headers[idx]
+                    break
+                except ValueError:
+                    continue
+            mapping[model_field] = found
+        return mapping
+
+    # ------------------------------------------------------------------ #
+    # Employee lookup & fuzzy matching
+    # ------------------------------------------------------------------ #
+
+    def _load_employees(self) -> None:
+        self._employees = self.db.list_employees(active_only=False)
+
+    def _employee_candidates(self) -> List[str]:
+        """Build candidate strings = 'name (code)' or 'name'."""
+        out = []
+        for e in self._employees:
+            name = e.get("name", "")
+            code = e.get("employee_code") or ""
+            out.append(name)
+        return out
+
+    def match_employee(self, name_raw: str) -> List[MatchSuggestion]:
+        """Return top-3 fuzzy matches for *name_raw* from the employee table."""
+        if not self._employees:
+            self._load_employees()
+        candidates = self._employee_candidates()
+        results = self.matcher.match(name_raw, candidates, top_n=3)
+        suggestions = []
+        for cand_str, score, idx in results:
+            emp = self._employees[idx]
+            suggestions.append(MatchSuggestion(
+                employee_id=emp["id"],
+                employee_name=emp["name"],
+                employee_code=emp.get("employee_code"),
+                score=round(score, 1),
+            ))
+        return suggestions
+
+    # ------------------------------------------------------------------ #
+    # Validation
+    # ------------------------------------------------------------------ #
+
+    def validate_loan_row(self, row: Dict, mapping: Dict[str, Optional[str]],
+                          row_index: int) -> ImportRowResult:
+        result = ImportRowResult(row_index=row_index, raw_data=row)
+        norm = {}
+
+        def get(field: str) -> Any:
+            col = mapping.get(field)
+            return row.get(col) if col else None
+
+        # Employee name (required)
+        emp_name = str(get("employee_name") or "").strip()
+        result.employee_name_raw = emp_name
+        err = validate_required(emp_name, "employee_name")
+        if err:
+            result.errors.append(err)
+        else:
+            # Try employee_code first
+            emp_code = str(get("employee_code") or "").strip()
+            if emp_code:
+                emp_row = self.db.fetch_one(
+                    "SELECT * FROM employees WHERE employee_code=?", (emp_code,)
+                )
+                if emp_row:
+                    result.employee_id = emp_row["id"]
+                    result.auto_matched = True
+                    norm["employee_id"] = emp_row["id"]
+            if not result.employee_id:
+                suggestions = self.match_employee(emp_name)
+                result.match_suggestions = suggestions
+                if suggestions and suggestions[0].score >= self.threshold:
+                    result.employee_id = suggestions[0].employee_id
+                    result.auto_matched = True
+                    norm["employee_id"] = result.employee_id
+
+        # requested_amount
+        amt, err = parse_amount(get("requested_amount"))
+        if err:
+            result.errors.append(err)
+        else:
+            norm["requested_amount"] = amt
+
+        # interest_rate (optional, default 0)
+        rate, err = parse_rate(get("interest_rate"))
+        if err:
+            result.warnings.append(err)
+            norm["interest_rate"] = 0.0
+        else:
+            norm["interest_rate"] = rate
+
+        # term_months
+        term, err = parse_positive_int(get("term_months") or 1, "term_months")
+        if err:
+            result.warnings.append(f"term_months: {err}; defaulting to 1")
+            norm["term_months"] = 1
+        else:
+            norm["term_months"] = term
+
+        # application_date (optional)
+        dt, err = parse_date(get("application_date"))
+        if err and get("application_date"):
+            result.warnings.append(f"application_date: {err}")
+        norm["application_date"] = dt.date().isoformat() if dt else None
+
+        norm["purpose"] = str(get("purpose") or "").strip() or None
+        result.normalized = norm
+        result.status = "valid" if result.is_valid else "invalid"
         return result
 
-    def _apply_mapping(self, row: Dict, mapping: Dict[str, str]) -> Dict:
-        """Remap column keys according to user-supplied mapping."""
-        mapped: Dict[str, Any] = {}
-        for src_col, target_field in mapping.items():
-            if src_col in row:
-                mapped[target_field] = row[src_col]
-        # pass through unmapped columns too
-        for k, v in row.items():
-            if k not in mapping:
-                mapped[k] = v
-        return mapped
+    def validate_repayment_row(self, row: Dict, mapping: Dict[str, Optional[str]],
+                               row_index: int) -> ImportRowResult:
+        result = ImportRowResult(row_index=row_index, raw_data=row)
+        norm = {}
 
-    # ── Validation + Fuzzy Matching ───────────────────────────────────────────
+        def get(field: str) -> Any:
+            col = mapping.get(field)
+            return row.get(col) if col else None
 
-    def validate_and_match(
-        self,
-        rows: List[Dict],
-        import_type: str = "loan",
-    ) -> List[ImportRowResult]:
-        """Validate rows and run fuzzy employee matching.
+        # Employee matching
+        emp_name = str(get("employee_name") or "").strip()
+        result.employee_name_raw = emp_name
+        if emp_name:
+            suggestions = self.match_employee(emp_name)
+            result.match_suggestions = suggestions
+            if suggestions and suggestions[0].score >= self.threshold:
+                result.employee_id = suggestions[0].employee_id
+                result.auto_matched = True
 
-        Args:
-            rows:        Raw row dicts from :meth:`parse_file`.
-            import_type: ``"loan"`` or ``"repayment"``.
+        # Loan reference
+        loan_ref = str(get("loan_reference") or "").strip()
+        if not loan_ref:
+            result.errors.append("loan_reference is required")
+        else:
+            loan_row = self.db.get_loan_by_reference(loan_ref)
+            if loan_row:
+                norm["loan_id"] = loan_row["id"]
+            else:
+                result.errors.append(f"Loan reference '{loan_ref}' not found")
+        norm["loan_reference"] = loan_ref
 
-        Returns:
-            List of :class:`ImportRowResult` objects.
-        """
-        employees = db.get_all_employees(active_only=False)
-        candidate_names = [e["name"] for e in employees]
-        candidate_codes = [e.get("employee_code") or "" for e in employees]
+        # amount
+        amt, err = parse_amount(get("amount"))
+        if err:
+            result.errors.append(err)
+        else:
+            norm["amount"] = amt
 
+        # payment_date
+        dt, err = parse_date(get("payment_date"))
+        if err:
+            result.errors.append(f"payment_date: {err}")
+        else:
+            norm["payment_date"] = dt.date().isoformat() if dt else None
+
+        norm["payment_method"] = str(get("payment_method") or "cash").strip() or "cash"
+        norm["reference"] = str(get("reference") or "").strip() or None
+        norm["notes"] = str(get("notes") or "").strip() or None
+
+        result.normalized = norm
+        result.status = "valid" if (not result.errors and norm.get("loan_id")) else "invalid"
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Validate all rows
+    # ------------------------------------------------------------------ #
+
+    def validate_rows(self, raw_rows: List[Dict], mapping: Dict[str, Optional[str]],
+                      import_type: str = "loan") -> List[ImportRowResult]:
+        """Validate all rows and return ImportRowResult list."""
+        self._load_employees()
         results = []
-        for i, row in enumerate(rows, start=1):
-            result = ImportRowResult(row_number=i, raw=row)
-            result.normalized = self._normalize(row, import_type)
-
-            # Validation
+        for idx, row in enumerate(raw_rows, start=1):
             if import_type == "loan":
-                result.errors = validate_loan_row(result.normalized)
+                results.append(self.validate_loan_row(row, mapping, idx))
             else:
-                result.errors = validate_repayment_row(result.normalized)
-
-            if result.errors:
-                result.status = STATUS_ERROR
-            else:
-                result.status = STATUS_VALID
-
-            # Fuzzy matching
-            query_name = str(result.normalized.get("employee_name") or "").strip()
-            query_code = str(result.normalized.get("employee_code") or "").strip()
-
-            if query_name or query_code:
-                result.employee_matches = self._match_employees(
-                    query_name, query_code, employees, candidate_names, candidate_codes
-                )
-                if result.employee_matches:
-                    best = result.employee_matches[0]
-                    if best.score >= self.threshold:
-                        best.auto_selected = True
-                        result.selected_employee_id = best.employee_id
-                        if result.status == STATUS_VALID:
-                            result.status = STATUS_MATCHED
-                    else:
-                        result.status = STATUS_UNMATCHED
-                        result.warnings.append(
-                            f"No employee match above {self.threshold}% "
-                            f"(best: '{best.name}' at {best.score:.1f}%)."
-                        )
-                else:
-                    result.status = STATUS_UNMATCHED
-                    result.warnings.append("No employee candidates found in database.")
-
-            results.append(result)
-
+                results.append(self.validate_repayment_row(row, mapping, idx))
         return results
 
-    def _normalize(self, row: Dict, import_type: str) -> Dict:
-        """Normalise raw row values to model-compatible types."""
-        n: Dict[str, Any] = {}
-        # employee identifiers
-        n["employee_name"] = str(row.get("employee_name") or row.get("name") or "").strip()
-        n["employee_code"] = str(row.get("employee_code") or row.get("emp_code") or "").strip()
+    # ------------------------------------------------------------------ #
+    # Dry-run
+    # ------------------------------------------------------------------ #
 
-        if import_type == "loan":
-            n["requested_amount"] = parse_decimal(
-                row.get("requested_amount") or row.get("amount") or row.get("loan_amount")
-            )
-            n["interest_rate"] = parse_decimal(row.get("interest_rate") or 0)
-            n["term_months"] = parse_int(row.get("term_months") or 1)
-            n["purpose"] = str(row.get("purpose") or "").strip()
-            n["application_date"] = parse_date(
-                row.get("application_date") or row.get("date")
-            )
-            n["notes"] = str(row.get("notes") or "").strip()
-            n["status"] = str(row.get("status") or "pending").strip().lower()
-            n["reference_number"] = str(row.get("reference_number") or row.get("reference") or "").strip()
+    def dry_run_import(self, results: List[ImportRowResult],
+                       import_type: str = "loan") -> ImportSummary:
+        """Simulate import without writing to DB."""
+        valid = [r for r in results if r.is_valid]
+        invalid = [r for r in results if not r.is_valid]
+        return ImportSummary(
+            file_name="",
+            import_type=import_type,
+            total_rows=len(results),
+            imported=len(valid),
+            failed=len(invalid),
+            dry_run=True,
+        )
 
-        elif import_type == "repayment":
-            n["amount"] = parse_decimal(row.get("amount") or row.get("payment_amount"))
-            n["payment_date"] = parse_date(row.get("payment_date") or row.get("date"))
-            n["payment_method"] = str(row.get("payment_method") or "cash").strip().lower()
-            n["reference"] = str(row.get("reference") or "").strip()
-            n["loan_reference"] = str(row.get("loan_reference") or row.get("loan_ref") or "").strip()
-            n["loan_id"] = parse_int(row.get("loan_id"))
-            n["notes"] = str(row.get("notes") or "").strip()
+    # ------------------------------------------------------------------ #
+    # Commit
+    # ------------------------------------------------------------------ #
 
-        return n
-
-    def _match_employees(
-        self,
-        query_name: str,
-        query_code: str,
-        employees: List[Dict],
-        candidate_names: List[str],
-        candidate_codes: List[str],
-    ) -> List[EmployeeMatch]:
-        """Run fuzzy match against employee names and codes."""
-        score_map: Dict[int, float] = {}
-
-        # Match by name
-        if query_name:
-            name_results = self.matcher.match(query_name, candidate_names, top_n=5)
-            for cand_name, score, idx in name_results:
-                emp_id = employees[idx]["id"]
-                score_map[emp_id] = max(score_map.get(emp_id, 0), score)
-
-        # Match by code (exact first, then fuzzy)
-        if query_code:
-            for emp in employees:
-                if emp.get("employee_code") == query_code:
-                    score_map[emp["id"]] = max(score_map.get(emp["id"], 0), 100.0)
-            code_results = self.matcher.match(query_code, candidate_codes, top_n=3)
-            for cand_code, score, idx in code_results:
-                if cand_code:
-                    emp_id = employees[idx]["id"]
-                    score_map[emp_id] = max(score_map.get(emp_id, 0), score)
-
-        # Build sorted EmployeeMatch list
-        matches = []
-        emp_index = {e["id"]: e for e in employees}
-        for emp_id, score in sorted(score_map.items(), key=lambda x: -x[1])[:3]:
-            emp = emp_index[emp_id]
-            matches.append(EmployeeMatch(
-                employee_id=emp_id,
-                name=emp["name"],
-                employee_code=emp.get("employee_code"),
-                score=score,
-            ))
-        return matches
-
-    # ── Dry-run / Commit ──────────────────────────────────────────────────────
-
-    def commit_import(
-        self,
-        results: List[ImportRowResult],
-        import_type: str,
-        dry_run: bool = False,
-        file_name: str = "unknown",
-    ) -> Dict[str, Any]:
-        """Commit or dry-run validated import results.
-
-        Args:
-            results:     Validated :class:`ImportRowResult` list.
-            import_type: ``"loan"`` or ``"repayment"``.
-            dry_run:     If ``True``, simulate without writing to DB.
-            file_name:   Original file name for audit logging.
-
-        Returns:
-            Summary dict with counts and log path.
-        """
-        committed = 0
-        skipped = 0
-        failed = 0
+    def commit_import(self, results: List[ImportRowResult], import_type: str,
+                      user_id: Optional[int], file_name: str) -> ImportSummary:
+        """Commit valid rows to the DB and write an import log."""
+        from datetime import date as _date
+        summary = ImportSummary(
+            file_name=file_name,
+            import_type=import_type,
+            total_rows=len(results),
+            dry_run=False,
+        )
         log_rows = []
 
-        for res in results:
-            if res.status in (STATUS_ERROR, STATUS_UNMATCHED) and not res.selected_employee_id:
-                res.final_status = STATUS_SKIPPED
-                res.final_message = "; ".join(res.errors) or "Unmatched / error"
-                skipped += 1
-                log_rows.append(self._log_row(res))
+        for result in results:
+            if not result.is_valid:
+                result.status = "skipped"
+                summary.skipped += 1
+                log_rows.append({
+                    "row": result.row_index,
+                    "status": "skipped",
+                    "reason": "; ".join(result.errors),
+                })
                 continue
-
-            if dry_run:
-                res.final_status = "dry_run_ok"
-                res.final_message = "Would be imported."
-                committed += 1
-                log_rows.append(self._log_row(res))
-                continue
-
             try:
+                norm = result.normalized
                 if import_type == "loan":
-                    self._insert_loan(res)
-                else:
-                    self._insert_repayment(res)
-                res.final_status = STATUS_IMPORTED
-                res.final_message = "Imported successfully."
-                committed += 1
-            except Exception as exc:  # noqa: BLE001
-                res.final_status = STATUS_FAILED
-                res.final_message = str(exc)
-                failed += 1
-                log.error("Import row %d failed: %s", res.row_number, exc)
+                    ref = generate_reference("CA")
+                    total = norm["requested_amount"] * (
+                        1 + (norm.get("interest_rate", 0) / 100) * norm.get("term_months", 1)
+                    )
+                    loan_data = {
+                        "reference_number": ref,
+                        "employee_id": result.employee_id,
+                        "requested_amount": norm["requested_amount"],
+                        "approved_amount": None,
+                        "interest_rate": norm.get("interest_rate", 0.0),
+                        "term_months": norm.get("term_months", 1),
+                        "status": "pending",
+                        "purpose": norm.get("purpose"),
+                        "application_date": norm.get("application_date") or _date.today().isoformat(),
+                        "due_date": None,
+                        "outstanding_balance": total,
+                        "branch_id": None,
+                        "created_by": user_id,
+                    }
+                    loan_id = self.db.create_loan(loan_data)
+                    self.db.log_action(user_id, "IMPORT_LOAN", "loans", loan_id,
+                                       f"File:{file_name} Row:{result.row_index}")
+                    result.status = "imported"
+                    summary.imported += 1
+                    log_rows.append({"row": result.row_index, "status": "imported",
+                                     "reference": ref, "reason": ""})
+                else:  # repayment
+                    rep_id = self.db.create_repayment(
+                        norm["loan_id"], norm["amount"], norm["payment_date"],
+                        norm.get("payment_method", "cash"), norm.get("reference"),
+                        norm.get("notes"), user_id,
+                    )
+                    # Update outstanding balance
+                    total_paid = self.db.sum_repayments(norm["loan_id"])
+                    loan_row = self.db.get_loan_by_id(norm["loan_id"])
+                    if loan_row:
+                        payable = Loan.from_row(loan_row).total_payable()
+                        self.db.update_outstanding_balance(norm["loan_id"],
+                                                           max(0.0, payable - total_paid))
+                    self.db.log_action(user_id, "IMPORT_REPAYMENT", "repayments", rep_id,
+                                       f"File:{file_name} Row:{result.row_index}")
+                    result.status = "imported"
+                    summary.imported += 1
+                    log_rows.append({"row": result.row_index, "status": "imported", "reason": ""})
+            except Exception as exc:
+                log.error("Import error row %d: %s", result.row_index, exc)
+                result.status = "failed"
+                summary.failed += 1
+                log_rows.append({"row": result.row_index, "status": "failed", "reason": str(exc)})
 
-            log_rows.append(self._log_row(res))
-
-        summary = {
-            "dry_run": dry_run,
-            "import_type": import_type,
-            "file_name": file_name,
-            "total": len(results),
-            "committed": committed,
-            "skipped": skipped,
-            "failed": failed,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        log_path = self._write_import_log(log_rows, summary)
-        summary["log_path"] = log_path
-
-        if not dry_run:
-            db.write_audit_log(
-                action="IMPORT",
-                user_id=self.user_id,
-                table_name=import_type + "s",
-                detail=json.dumps(summary),
-            )
-
-        log.info("Import %s: committed=%d skipped=%d failed=%d (dry_run=%s).",
-                 file_name, committed, skipped, failed, dry_run)
+        summary.log_path = self._write_import_log(summary, log_rows)
         return summary
 
-    def _insert_loan(self, res: ImportRowResult) -> None:
-        """Insert a single validated loan row into the DB."""
-        n = res.normalized
-        emp_id = res.selected_employee_id
-        if not emp_id:
-            raise ValueError("No employee selected.")
-        from src.utils.helpers import generate_reference_number
-        db.create_loan({
-            "reference_number": n.get("reference_number") or generate_reference_number("CA"),
-            "employee_id": emp_id,
-            "requested_amount": float(n["requested_amount"]),
-            "interest_rate": float(n.get("interest_rate") or 0),
-            "term_months": int(n.get("term_months") or 1),
-            "purpose": n.get("purpose"),
-            "status": n.get("status", "pending"),
-            "application_date": str(n["application_date"]) if n.get("application_date") else None,
-            "notes": n.get("notes"),
-            "processed_by": self.user_id,
-        })
+    # ------------------------------------------------------------------ #
+    # Import log
+    # ------------------------------------------------------------------ #
 
-    def _insert_repayment(self, res: ImportRowResult) -> None:
-        """Insert a single validated repayment row into the DB."""
-        n = res.normalized
-        # Resolve loan_id
-        loan_id = n.get("loan_id")
-        if not loan_id and n.get("loan_reference"):
-            loan = db.get_loan_by_reference(n["loan_reference"])
-            if not loan:
-                raise ValueError(f"Loan reference '{n['loan_reference']}' not found.")
-            loan_id = loan["id"]
-        if not loan_id:
-            raise ValueError("Cannot resolve loan_id or loan_reference.")
-        db.create_repayment({
-            "loan_id": int(loan_id),
-            "payment_date": str(n["payment_date"]),
-            "amount": float(n["amount"]),
-            "payment_method": n.get("payment_method", "cash"),
-            "reference": n.get("reference"),
-            "notes": n.get("notes"),
-            "recorded_by": self.user_id,
-        })
-
-    # ── Log helpers ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _log_row(res: ImportRowResult) -> Dict:
-        return {
-            "row": res.row_number,
-            "status": res.final_status or res.status,
-            "employee_id": res.selected_employee_id,
-            "errors": "; ".join(res.errors),
-            "warnings": "; ".join(res.warnings),
-            "message": res.final_message,
-        }
-
-    def _write_import_log(self, log_rows: List[Dict], summary: Dict) -> str:
-        """Write a detailed CSV import log to data_files/import_logs/.
-
-        Args:
-            log_rows: List of row-level dicts.
-            summary:  Import summary dict.
-
-        Returns:
-            Path to the written log file.
-        """
-        fname = timestamp_filename("import_log", "csv")
-        log_path = IMPORT_LOGS_DIR / fname
-
+    def _write_import_log(self, summary: ImportSummary, log_rows: List[Dict]) -> str:
         import csv as _csv
-        with open(log_path, "w", newline="", encoding="utf-8") as fh:
-            # Write summary header
-            fh.write(f"# Import Log – {summary.get('timestamp')}\n")
-            fh.write(f"# file={summary.get('file_name')}, type={summary.get('import_type')}, "
-                     f"dry_run={summary.get('dry_run')}\n")
-            fh.write(f"# total={summary.get('total')}, committed={summary.get('committed')}, "
-                     f"skipped={summary.get('skipped')}, failed={summary.get('failed')}\n")
-
-            if log_rows:
-                writer = _csv.DictWriter(fh, fieldnames=list(log_rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(log_rows)
-
-        log.info("Import log written: %s", log_path)
-        return str(log_path)
-
-    # ── Column detection ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def detect_columns(file_path: str, sheet_index: int = 0) -> List[str]:
-        """Return the column headers found in the file without loading all rows.
-
-        Args:
-            file_path:   Path to CSV or XLSX.
-            sheet_index: XLSX sheet (0-based).
-
-        Returns:
-            List of column header strings.
-        """
-        path = Path(file_path)
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            with path.open(newline="", encoding="utf-8-sig") as fh:
-                sample = fh.read(4096)
-                fh.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-                except csv.Error:
-                    dialect = csv.excel
-                reader = csv.DictReader(fh, dialect=dialect)
-                return list(reader.fieldnames or [])
-        else:
-            import openpyxl  # type: ignore
-            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            ws = wb.worksheets[sheet_index]
-            first_row = next(ws.iter_rows(values_only=True), [])
-            return [str(h).strip() if h is not None else "" for h in first_row]
-
-    @staticmethod
-    def get_sheet_names(file_path: str) -> List[str]:
-        """Return sheet names for an Excel file.
-
-        Args:
-            file_path: Path to XLSX.
-
-        Returns:
-            List of sheet name strings.
-        """
-        import openpyxl  # type: ignore
-        wb = openpyxl.load_workbook(file_path, read_only=True)
-        return wb.sheetnames
+        log_dir = os.path.join(get_app_data_dir(), "import_logs")
+        ensure_dir(log_dir)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"import_{summary.import_type}_{ts}.csv")
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = _csv.DictWriter(f, fieldnames=["row", "status", "reason", "reference"])
+            writer.writeheader()
+            for row in log_rows:
+                row.setdefault("reference", "")
+                writer.writerow(row)
+        # Audit
+        self.db.log_action(None, "IMPORT_COMPLETE", details=json.dumps({
+            "file": summary.file_name,
+            "type": summary.import_type,
+            "total": summary.total_rows,
+            "imported": summary.imported,
+            "failed": summary.failed,
+            "dry_run": summary.dry_run,
+        }))
+        log.info("Import log saved: %s", log_path)
+        return log_path

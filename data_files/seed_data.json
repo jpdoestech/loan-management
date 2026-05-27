@@ -1,0 +1,22 @@
+{
+  "branches": [
+    {"name": "Head Office",     "code": "HO",  "address": "123 Main St, Manila"},
+    {"name": "Quezon City",     "code": "QC",  "address": "456 EDSA, Quezon City"},
+    {"name": "Makati Branch",   "code": "MKT", "address": "789 Ayala Ave, Makati"}
+  ],
+  "employees": [
+    {"name": "Juan dela Cruz",      "employee_code": "EMP001", "department": "Finance",    "position": "Accountant"},
+    {"name": "Maria Santos",        "employee_code": "EMP002", "department": "IT",         "position": "Developer"},
+    {"name": "Pedro Reyes",         "employee_code": "EMP003", "department": "HR",         "position": "Manager"},
+    {"name": "Ana Garcia",          "employee_code": "EMP004", "department": "Operations", "position": "Supervisor"},
+    {"name": "Jose Rizal Jr.",      "employee_code": "EMP005", "department": "Sales",      "position": "Agent"},
+    {"name": "Luz Evangelista",     "employee_code": "EMP006", "department": "Finance",    "position": "Clerk"},
+    {"name": "Roberto Mendoza",     "employee_code": "EMP007", "department": "IT",         "position": "Sysadmin"},
+    {"name": "Carla Villanueva",    "employee_code": "EMP008", "department": "HR",         "position": "Recruiter"}
+  ],
+  "users": [
+    {"username": "admin",   "password": "admin123",   "full_name": "Administrator",  "role": "admin"},
+    {"username": "manager", "password": "manager123", "full_name": "Branch Manager", "role": "manager"},
+    {"username": "staff",   "password": "staff123",   "full_name": "Staff User",     "role": "staff"}
+  ]
+}
